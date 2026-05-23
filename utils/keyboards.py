@@ -26,8 +26,19 @@ def colourful_dashboard_keyboard(balance: float, referral_count: int) -> InlineK
             InlineKeyboardButton(text="🔴 💸 Withdraw", callback_data="withdraw"),
         ],
         [InlineKeyboardButton(text="🟣 📜 Withdrawal History", callback_data="withdraw_history")],
+        [InlineKeyboardButton(text="🗑️ Delete My Account", callback_data="delete_account")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def confirm_delete_keyboard() -> InlineKeyboardMarkup:
+    """Confirmation keyboard for account deletion."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Yes, Delete Everything", callback_data="confirm_delete"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="dashboard"),
+        ]
+    ])
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
