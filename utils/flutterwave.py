@@ -6,6 +6,7 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 FLW_BASE = "https://api.flutterwave.com/v3"
+FLW_TOKEN_URL = "https://idp.flutterwave.com/realms/flutterwave/protocol/openid-connect/token"
 
 # Nigerian banks list (code: name)
 NIGERIAN_BANKS = {
@@ -38,14 +39,38 @@ NIGERIAN_BANKS = {
 }
 
 
+async def get_access_token() -> str:
+    """Get OAuth2 access token from Flutterwave."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                FLW_TOKEN_URL,
+                data={
+                    "client_id": settings.FLW_CLIENT_ID,
+                    "client_secret": settings.FLW_CLIENT_SECRET,
+                    "grant_type": "client_credentials"
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15.0
+            )
+            data = response.json()
+            return data.get("access_token", "")
+    except Exception as e:
+        logger.error(f"Token error: {e}")
+        return ""
+
+
 async def verify_bank_account(account_number: str, bank_code: str) -> dict:
     """Verify a Nigerian bank account via Flutterwave."""
     try:
+        token = await get_access_token()
+        if not token:
+            return {"success": False, "message": "Auth error. Try again."}
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{FLW_BASE}/accounts/resolve",
                 headers={
-                    "Authorization": f"Bearer {settings.FLW_SECRET_KEY}",
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json"
                 },
                 json={
@@ -71,11 +96,14 @@ async def send_payout(account_number: str, bank_code: str, bank_name: str, amoun
     """Send NGN payout via Flutterwave Transfer API."""
     reference = f"mm_{user_id}_{uuid.uuid4().hex[:8]}"
     try:
+        token = await get_access_token()
+        if not token:
+            return {"success": False, "message": "Auth error. Try again."}
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{FLW_BASE}/transfers",
                 headers={
-                    "Authorization": f"Bearer {settings.FLW_SECRET_KEY}",
+                    "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json"
                 },
                 json={
