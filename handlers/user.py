@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from aiogram import Router, F, Bot
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
@@ -9,7 +10,10 @@ from models.db import (
     update_user_balance, increment_referral_count,
     get_onboarding_tasks, get_user_completions
 )
-from utils.keyboards import onboarding_keyboard, whatsapp_tasks_keyboard, dashboard_keyboard, back_to_dashboard
+from utils.keyboards import (
+    welcome_keyboard, onboarding_keyboard,
+    whatsapp_tasks_keyboard, dashboard_keyboard, back_to_dashboard
+)
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -17,7 +21,7 @@ router = Router()
 
 
 # ─────────────────────────────────────────
-# /start
+# /start — Welcome Screen
 # ─────────────────────────────────────────
 
 @router.message(CommandStart())
@@ -44,49 +48,72 @@ async def cmd_start(message: Message, db, bot: Bot):
         await show_dashboard(message, db, user_id)
         return
 
-    # Get bot settings
+    # Show welcome screen
+    bot_settings = await get_settings(db)
+    pool = bot_settings.get("total_reward_pool", 500000)
+    ref_reward = bot_settings.get("referral_reward", 100)
+    bot_name = bot_settings.get("bot_name", "DoGetPaid Bot")
+
+    await message.answer(
+        f"💸 *Welcome to {bot_name}!*\n\n"
+        f"🏆 Complete tasks, invite friends and earn real *Naira* daily!\n\n"
+        f"🎁 *Total Reward Pool:* ₦{pool:,.0f}\n"
+        f"👤 *Earn per Referral:* ₦{ref_reward:,.0f}\n\n"
+        f"⚡ Fast • Easy • Reliable\n\n"
+        f"Tap *Proceed* to get started!",
+        reply_markup=welcome_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────
+# Proceed button — Show Telegram Tasks
+# ─────────────────────────────────────────
+
+@router.callback_query(F.data == "proceed_onboarding")
+async def proceed_onboarding(callback: CallbackQuery, db, bot: Bot):
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    onboarding_tasks = await get_onboarding_tasks(db)
+    channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
+
+    if not channel_tasks:
+        # No channel tasks — check WhatsApp tasks
+        wa_tasks = [t for t in onboarding_tasks if t["task_type"] == "whatsapp"]
+        if wa_tasks:
+            await callback.message.answer(
+                "📱 *Join the WhatsApp groups below to continue:*",
+                reply_markup=whatsapp_tasks_keyboard(wa_tasks),
+                parse_mode="Markdown"
+            )
+        else:
+            await _complete_onboarding(callback.message, db, user_id)
+        return
+
     bot_settings = await get_settings(db)
     pool = bot_settings.get("total_reward_pool", 500000)
     ref_reward = bot_settings.get("referral_reward", 100)
 
-    # Get onboarding tasks
-    onboarding_tasks = await get_onboarding_tasks(db)
-
-    # Filter channel tasks (for joining)
-    channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
-
-    text = (
-        f"🎁 *{bot_settings.get('bot_name', 'MOREMONEE')} Is Live* 🔄\n\n"
-        f"🎁 *Total Reward:* ₦{pool:,.0f}\n"
-        f"👤 *Earn per Referral:* ₦{ref_reward:,.0f}\n\n"
-        f"📋 *Instructions:*\n"
-        f"Join all channels below and tap \"Done\" to proceed."
-    )
-
-    if not channel_tasks:
-        # No onboarding tasks configured yet, go straight to dashboard
-        await mark_onboarded(db, user_id)
-        await _credit_referrer(db, user, ref_reward)
-        await show_dashboard(message, db, user_id)
-        return
-
-    await message.answer(
-        text,
+    await callback.message.answer(
+        f"📋 *Step 1: Join All Channels*\n\n"
+        f"🎁 Total Reward: ₦{pool:,.0f}\n"
+        f"👤 Earn per Referral: ₦{ref_reward:,.0f}\n\n"
+        f"📌 Join all channels below and tap *Done* to proceed.",
         reply_markup=onboarding_keyboard(channel_tasks),
         parse_mode="Markdown"
     )
 
 
 # ─────────────────────────────────────────
-# ONBOARDING — Done button (channel tasks)
+# Done button — Verify Telegram Channels
 # ─────────────────────────────────────────
 
 @router.callback_query(F.data == "onboarding_done")
 async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
-    user_id = callback.from_user.id
     await callback.answer()
+    user_id = callback.from_user.id
 
-    # Get onboarding channel tasks
     onboarding_tasks = await get_onboarding_tasks(db)
     channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
 
@@ -112,32 +139,53 @@ async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
         )
         return
 
-    # Check for WhatsApp/manual onboarding tasks
-    wa_tasks = [t for t in onboarding_tasks if t["task_type"] in ["whatsapp", "visit_link"]]
+    # Check for WhatsApp tasks
+    wa_tasks = [t for t in onboarding_tasks if t["task_type"] == "whatsapp"]
 
     if wa_tasks:
         await callback.message.answer(
-            f"✅ Great! Now join the groups below to continue:",
-            reply_markup=whatsapp_tasks_keyboard(wa_tasks)
+            "✅ *Channels verified!*\n\n"
+            "📱 *Step 2: Join WhatsApp Groups*\n\n"
+            "Join all WhatsApp groups below, then tap *I've Joined*.",
+            reply_markup=whatsapp_tasks_keyboard(wa_tasks),
+            parse_mode="Markdown"
         )
     else:
-        # No extra tasks — complete onboarding
         await _complete_onboarding(callback.message, db, user_id)
 
 
 # ─────────────────────────────────────────
-# ONBOARDING — Extra tasks Done
+# WhatsApp "I've Joined" — 15sec countdown
 # ─────────────────────────────────────────
 
-@router.callback_query(F.data == "extra_tasks_done")
-async def extra_tasks_done(callback: CallbackQuery, db):
-    user_id = callback.from_user.id
+@router.callback_query(F.data == "whatsapp_joined")
+async def whatsapp_joined(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    user_id = callback.from_user.id
+
+    # Send countdown message
+    msg = await callback.message.answer("⏳ *Verifying... 15*", parse_mode="Markdown")
+
+    # Countdown from 15 to 1
+    for i in range(14, 0, -1):
+        await asyncio.sleep(1)
+        try:
+            await msg.edit_text(f"⏳ *Verifying... {i}*", parse_mode="Markdown")
+        except Exception:
+            pass
+
+    await asyncio.sleep(1)
+    await msg.edit_text("✅ *Verified!*", parse_mode="Markdown")
+
+    # Complete onboarding
     await _complete_onboarding(callback.message, db, user_id)
 
 
+# ─────────────────────────────────────────
+# Complete Onboarding
+# ─────────────────────────────────────────
+
 async def _complete_onboarding(message: Message, db, user_id: int):
-    """Mark user as onboarded, credit referrer, show dashboard."""
     user = await get_user(db, user_id)
     if user and not user.get("onboarded"):
         await mark_onboarded(db, user_id)
@@ -145,12 +193,11 @@ async def _complete_onboarding(message: Message, db, user_id: int):
         ref_reward = bot_settings.get("referral_reward", 100)
         await _credit_referrer(db, user, ref_reward)
 
-    await message.answer("🎉 Welcome aboard! Here's your dashboard:")
+    await message.answer("🎉 *Welcome aboard!* Here's your dashboard:", parse_mode="Markdown")
     await show_dashboard(message, db, user_id)
 
 
 async def _credit_referrer(db, user: dict, ref_reward: float):
-    """Credit the person who referred this user."""
     referred_by = user.get("referred_by")
     if referred_by:
         referrer = await get_user(db, referred_by)
@@ -172,15 +219,11 @@ async def show_dashboard(message: Message, db, user_id: int):
     referral_count = user.get("referral_count", 0)
     username = message.from_user.first_name if hasattr(message, 'from_user') else user.get("username", "User")
 
-    text = (
+    await message.answer(
         f"👋 Hello *{username}*!\n\n"
         f"💰 *Balance:* ₦{balance:,.0f}\n"
         f"👥 *Referrals:* {referral_count}\n\n"
-        f"What would you like to do?"
-    )
-
-    await message.answer(
-        text,
+        f"What would you like to do?",
         reply_markup=dashboard_keyboard(balance, referral_count),
         parse_mode="Markdown"
     )
@@ -231,7 +274,7 @@ async def get_referral_link(callback: CallbackQuery, db, bot: Bot):
     await callback.message.answer(
         f"🔗 *Your Referral Link*\n\n"
         f"`{ref_link}`\n\n"
-        f"Share this link and earn *₦{ref_reward:,.0f}* for every person who joins and completes onboarding!\n\n"
+        f"Share this link and earn *₦{ref_reward:,.0f}* for every person who joins!\n\n"
         f"👥 *Your referrals so far:* {user.get('referral_count', 0)}",
         reply_markup=back_to_dashboard(),
         parse_mode="Markdown"
