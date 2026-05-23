@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from aiogram import Router, F, Bot
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
@@ -12,12 +12,68 @@ from models.db import (
 )
 from utils.keyboards import (
     welcome_keyboard, onboarding_keyboard,
-    whatsapp_tasks_keyboard, dashboard_keyboard, back_to_dashboard
+    whatsapp_tasks_keyboard, dashboard_keyboard, back_to_dashboard,
+    colourful_dashboard_keyboard, main_menu_keyboard
 )
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+# ─────────────────────────────────────────
+# MEMBERSHIP RE-CHECK
+# ─────────────────────────────────────────
+
+async def verify_membership(user_id: int, bot: Bot, db) -> list:
+    """
+    Check if user is still in all onboarding channels.
+    Returns list of channel titles they've left. Empty list = all good.
+    """
+    onboarding_tasks = await get_onboarding_tasks(db)
+    channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
+    not_in = []
+    for task in channel_tasks:
+        channel_id = task.get("channel_id")
+        if channel_id:
+            try:
+                member = await bot.get_chat_member(channel_id, user_id)
+                if member.status in ["left", "kicked", "banned"]:
+                    not_in.append(task["title"])
+            except Exception as e:
+                logger.warning(f"Could not check channel {channel_id}: {e}")
+    return not_in
+
+
+async def show_colourful_menu(message: Message, db, user_id: int, bot: Bot):
+    """Fetch live data, run membership check, then show colourful panel."""
+    not_in = await verify_membership(user_id, bot, db)
+    if not_in:
+        channels_text = "\n".join([f"• {t}" for t in not_in])
+        onboarding_tasks = await get_onboarding_tasks(db)
+        channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
+        await message.answer(
+            f"⚠️ *You've left some required channels!*\n\n"
+            f"Please rejoin:\n{channels_text}\n\n"
+            f"Tap *Done* after rejoining to continue.",
+            reply_markup=onboarding_keyboard(channel_tasks),
+            parse_mode="Markdown"
+        )
+        return
+
+    user = await get_user(db, user_id)
+    balance = user.get("balance", 0) if user else 0
+    referral_count = user.get("referral_count", 0) if user else 0
+    username = message.from_user.first_name if hasattr(message, "from_user") and message.from_user else user.get("username", "User")
+
+    await message.answer(
+        f"👋 Hello *{username}*!\n\n"
+        f"💰 *Balance:* ₦{balance:,.0f}\n"
+        f"👥 *Referrals:* {referral_count}\n\n"
+        f"What would you like to do?",
+        reply_markup=colourful_dashboard_keyboard(balance, referral_count),
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────
@@ -43,9 +99,9 @@ async def cmd_start(message: Message, db, bot: Bot):
     # Create or get user
     user = await create_user(db, user_id, username, referred_by)
 
-    # If already onboarded, show dashboard
+    # If already onboarded, run membership re-check first
     if user.get("onboarded"):
-        await show_dashboard(message, db, user_id)
+        await show_colourful_menu(message, db, user_id, bot)
         return
 
     # Show welcome screen
@@ -64,6 +120,8 @@ async def cmd_start(message: Message, db, bot: Bot):
         reply_markup=welcome_keyboard(),
         parse_mode="Markdown"
     )
+    # Send persistent menu keyboard so it's always visible
+    await message.answer("👇 Use the menu button below anytime:", reply_markup=main_menu_keyboard())
 
 
 # ─────────────────────────────────────────
@@ -230,9 +288,33 @@ async def show_dashboard(message: Message, db, user_id: int):
 
 
 @router.callback_query(F.data == "dashboard")
-async def back_to_dash(callback: CallbackQuery, db):
+async def back_to_dash(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
-    await show_dashboard(callback.message, db, callback.from_user.id)
+    await show_colourful_menu(callback.message, db, callback.from_user.id, bot)
+
+
+# ─────────────────────────────────────────
+# /menu COMMAND + PERSISTENT BUTTON
+# ─────────────────────────────────────────
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, db, bot: Bot):
+    user_id = message.from_user.id
+    user = await get_user(db, user_id)
+    if not user or not user.get("onboarded"):
+        await message.answer("Please complete onboarding first. Type /start to begin.")
+        return
+    await show_colourful_menu(message, db, user_id, bot)
+
+
+@router.message(F.text == "📋 Menu")
+async def persistent_menu_button(message: Message, db, bot: Bot):
+    user_id = message.from_user.id
+    user = await get_user(db, user_id)
+    if not user or not user.get("onboarded"):
+        await message.answer("Please complete onboarding first. Type /start to begin.")
+        return
+    await show_colourful_menu(message, db, user_id, bot)
 
 
 # ─────────────────────────────────────────
