@@ -207,3 +207,14 @@ async def update_setting(db: AsyncIOMotorDatabase, key: str, value):
         {"$set": {key: value}},
         upsert=True
     )
+
+
+# ─────────────────────────────────────────
+# DELETE USER
+# ─────────────────────────────────────────
+
+async def delete_user(db: AsyncIOMotorDatabase, telegram_id: int):
+    """Wipe all user data from every collection."""
+    await db.users.delete_one({"telegram_id": telegram_id})
+    await db.completions.delete_many({"user_id": telegram_id})
+    await db.withdrawals.delete_many({"user_id": telegram_id})
