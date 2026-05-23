@@ -1,6 +1,6 @@
 import logging
 from aiogram import Router, F, Bot
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -11,7 +11,7 @@ from models.db import (
     get_user_withdrawals
 )
 from utils.keyboards import back_to_dashboard, confirm_withdraw_keyboard, admin_withdrawal_keyboard
-from utils.flutterwave import verify_bank_account, send_payout, NIGERIAN_BANKS, banks_list_text
+from utils.flutterwave import verify_bank_account, send_payout, NIGERIAN_BANKS
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -19,13 +19,29 @@ router = Router()
 
 
 class BankStates(StatesGroup):
-    waiting_bank_code = State()
     waiting_account_number = State()
     confirming_bank = State()
 
 
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
+
+
+def bank_selection_keyboard():
+    """Generate inline keyboard with all banks."""
+    buttons = []
+    row = []
+    for code, name in NIGERIAN_BANKS.items():
+        row.append(InlineKeyboardButton(
+            text=name,
+            callback_data=f"select_bank:{code}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ─────────────────────────────────────────
@@ -35,30 +51,25 @@ class WithdrawStates(StatesGroup):
 @router.callback_query(F.data == "set_bank")
 async def set_bank_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    banks_text = banks_list_text()
     await callback.message.answer(
-        f"💳 *Set Your Bank Account*\n\n"
-        f"Send your *bank code* first.\n\n"
-        f"{banks_text}\n\n"
-        f"Example: Send `033` for UBA",
+        "💳 *Set Your Bank Account*\n\nSelect your bank:",
+        reply_markup=bank_selection_keyboard(),
         parse_mode="Markdown"
     )
-    await state.set_state(BankStates.waiting_bank_code)
 
 
-@router.message(BankStates.waiting_bank_code)
-async def receive_bank_code(message: Message, state: FSMContext):
-    bank_code = message.text.strip()
-    if bank_code not in NIGERIAN_BANKS:
-        await message.answer(
-            f"❌ Invalid bank code: `{bank_code}`\n\nPlease send a valid code from the list.",
-            parse_mode="Markdown"
-        )
+@router.callback_query(F.data.startswith("select_bank:"))
+async def select_bank(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    bank_code = callback.data.split(":")[1]
+    bank_name = NIGERIAN_BANKS.get(bank_code)
+
+    if not bank_name:
+        await callback.message.answer("❌ Invalid bank. Try again.")
         return
 
-    bank_name = NIGERIAN_BANKS[bank_code]
     await state.update_data(bank_code=bank_code, bank_name=bank_name)
-    await message.answer(
+    await callback.message.answer(
         f"✅ Bank selected: *{bank_name}*\n\nNow send your *10-digit account number*:",
         parse_mode="Markdown"
     )
@@ -90,7 +101,6 @@ async def receive_account_number(message: Message, state: FSMContext, db):
     account_name = result["account_name"]
     await state.update_data(account_number=account, account_name=account_name)
 
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Yes, Save", callback_data="confirm_bank"),
@@ -207,7 +217,6 @@ async def receive_withdraw_amount(message: Message, state: FSMContext, db):
         await message.answer(f"❌ Insufficient balance. Your balance is ₦{balance:,.0f}. Try again:")
         return
 
-    # Create withdrawal record
     withdrawal = await create_withdrawal(
         db, user_id, amount,
         user["bank_account"], user["bank_name"], user["bank_code"]
@@ -240,7 +249,6 @@ async def confirm_withdrawal(callback: CallbackQuery, db, bot: Bot):
         await callback.message.edit_text("❌ This withdrawal request is no longer valid.")
         return
 
-    # Deduct balance immediately
     await update_user_balance(db, user_id, -withdrawal["amount"])
 
     await callback.message.edit_text(
@@ -252,7 +260,6 @@ async def confirm_withdrawal(callback: CallbackQuery, db, bot: Bot):
         parse_mode="Markdown"
     )
 
-    # Notify admins
     for admin_id in settings.ADMIN_IDS:
         try:
             await bot.send_message(
@@ -311,7 +318,7 @@ async def withdraw_history(callback: CallbackQuery, db):
 
 
 # ─────────────────────────────────────────
-# ADMIN — APPROVE WITHDRAWAL (Flutterwave)
+# ADMIN — APPROVE/REJECT WITHDRAWAL
 # ─────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("admin_approve:"))
@@ -320,7 +327,7 @@ async def admin_approve_withdrawal(callback: CallbackQuery, db, bot: Bot):
         await callback.answer("❌ Unauthorized", show_alert=True)
         return
 
-    await callback.answer("Processing...")
+    await callback.answer("Marked as paid!")
     parts = callback.data.split(":")
     withdrawal_id = parts[1]
     user_id = int(parts[2])
@@ -334,36 +341,22 @@ async def admin_approve_withdrawal(callback: CallbackQuery, db, bot: Bot):
         await callback.message.edit_text(f"Already {withdrawal['status']}.")
         return
 
-    # Trigger Flutterwave payout
-    result = await send_payout(
-        account_number=withdrawal["bank_account"],
-        bank_code=withdrawal["bank_code"],
-        bank_name=withdrawal["bank_name"],
-        amount=withdrawal["amount"],
-        user_id=user_id
+    await update_withdrawal_status(db, withdrawal_id, "paid")
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n✅ *MARKED AS PAID* by @{callback.from_user.username}",
+        parse_mode="Markdown"
     )
 
-    if result["success"]:
-        await update_withdrawal_status(db, withdrawal_id, "paid")
-        await callback.message.edit_text(
-            callback.message.text + f"\n\n✅ *PAID* via Flutterwave\nRef: `{result['reference']}`",
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 *Payment Sent!*\n\n"
+            f"₦{withdrawal['amount']:,.0f} has been transferred to your {withdrawal['bank_name']} account.\n"
+            f"It should arrive within minutes.",
             parse_mode="Markdown"
         )
-        try:
-            await bot.send_message(
-                user_id,
-                f"🎉 *Payment Sent!*\n\n"
-                f"₦{withdrawal['amount']:,.0f} has been transferred to your {withdrawal['bank_name']} account.\n"
-                f"It should arrive within minutes.",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.warning(f"Could not notify user {user_id}: {e}")
-    else:
-        await callback.message.edit_text(
-            callback.message.text + f"\n\n❌ *Payout failed:* {result['message']}",
-            parse_mode="Markdown"
-        )
+    except Exception as e:
+        logger.warning(f"Could not notify user {user_id}: {e}")
 
 
 @router.callback_query(F.data.startswith("admin_reject:"))
@@ -381,7 +374,6 @@ async def admin_reject_withdrawal(callback: CallbackQuery, db, bot: Bot):
     if not withdrawal:
         return
 
-    # Refund the balance
     await update_user_balance(db, user_id, withdrawal["amount"])
     await update_withdrawal_status(db, withdrawal_id, "rejected")
 
