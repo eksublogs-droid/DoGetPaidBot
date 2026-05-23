@@ -15,9 +15,9 @@ class Settings:
     ADMIN_IDS: list = None  # Will be set from env
 
     # Flutterwave
-    FLW_CLIENT_ID: str = os.getenv("FLW_CLIENT_ID", "")
-    FLW_CLIENT_SECRET: str = os.getenv("FLW_CLIENT_SECRET", "")
-
+    FLW_SECRET_KEY: str = os.getenv("FLW_SECRET_KEY", "")
+    FLW_PUBLIC_KEY: str = os.getenv("FLW_PUBLIC_KEY", "")
+    
     def __post_init__(self):
         admin_ids_str = os.getenv("ADMIN_IDS", "")
         self.ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
