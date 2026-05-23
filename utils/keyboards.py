@@ -1,4 +1,33 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent bottom reply keyboard — always visible in chat."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Menu")]
+        ],
+        resize_keyboard=True,
+        persistent=True
+    )
+
+
+def colourful_dashboard_keyboard(balance: float, referral_count: int) -> InlineKeyboardMarkup:
+    """Colourful dashboard panel — shown when Menu button or /menu is pressed."""
+    buttons = [
+        [
+            InlineKeyboardButton(text=f"🔵 💰 Balance: ₦{balance:,.0f}", callback_data="show_balance"),
+            InlineKeyboardButton(text=f"🔵 👥 Referrals: {referral_count}", callback_data="show_referrals"),
+        ],
+        [InlineKeyboardButton(text="🟢 🔗 My Referral Link", callback_data="get_referral_link")],
+        [InlineKeyboardButton(text="🟡 ✅ Tasks", callback_data="show_tasks")],
+        [
+            InlineKeyboardButton(text="🟠 💳 Set Bank Account", callback_data="set_bank"),
+            InlineKeyboardButton(text="🔴 💸 Withdraw", callback_data="withdraw"),
+        ],
+        [InlineKeyboardButton(text="🟣 📜 Withdrawal History", callback_data="withdraw_history")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
