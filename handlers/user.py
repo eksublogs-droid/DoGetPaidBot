@@ -8,12 +8,12 @@ from aiogram.fsm.context import FSMContext
 from models.db import (
     get_user, create_user, get_settings, mark_onboarded,
     update_user_balance, increment_referral_count,
-    get_onboarding_tasks, get_user_completions
+    get_onboarding_tasks, get_user_completions, delete_user
 )
 from utils.keyboards import (
     welcome_keyboard, onboarding_keyboard,
     whatsapp_tasks_keyboard, dashboard_keyboard, back_to_dashboard,
-    colourful_dashboard_keyboard, main_menu_keyboard
+    colourful_dashboard_keyboard, main_menu_keyboard, confirm_delete_keyboard
 )
 from config.settings import settings
 
@@ -45,8 +45,24 @@ async def verify_membership(user_id: int, bot: Bot, db) -> list:
     return not_in
 
 
-async def show_colourful_menu(message: Message, db, user_id: int, bot: Bot):
-    """Fetch live data, run membership check, then show colourful panel."""
+async def gate_check(message: Message, db, bot: Bot) -> bool:
+    """
+    Silently gate every action:
+    - If user not found or not onboarded → redirect to /start
+    - If user left a channel → show rejoin screen
+    Returns True if user can proceed, False if blocked.
+    """
+    user_id = message.from_user.id if hasattr(message, "from_user") and message.from_user else None
+    if not user_id:
+        return False
+
+    user = await get_user(db, user_id)
+    if not user or not user.get("onboarded"):
+        await message.answer(
+            "⚠️ You haven't completed onboarding yet.\n\nType /start to begin."
+        )
+        return False
+
     not_in = await verify_membership(user_id, bot, db)
     if not_in:
         channels_text = "\n".join([f"• {t}" for t in not_in])
@@ -59,6 +75,15 @@ async def show_colourful_menu(message: Message, db, user_id: int, bot: Bot):
             reply_markup=onboarding_keyboard(channel_tasks),
             parse_mode="Markdown"
         )
+        return False
+
+    return True
+
+
+async def show_colourful_menu(message: Message, db, user_id: int, bot: Bot):
+    """Run gate check then show colourful panel with live data."""
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
         return
 
     user = await get_user(db, user_id)
@@ -299,22 +324,123 @@ async def back_to_dash(callback: CallbackQuery, db, bot: Bot):
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, db, bot: Bot):
-    user_id = message.from_user.id
-    user = await get_user(db, user_id)
-    if not user or not user.get("onboarded"):
-        await message.answer("Please complete onboarding first. Type /start to begin.")
-        return
-    await show_colourful_menu(message, db, user_id, bot)
+    await show_colourful_menu(message, db, message.from_user.id, bot)
 
 
 @router.message(F.text == "📋 Menu")
 async def persistent_menu_button(message: Message, db, bot: Bot):
+    await show_colourful_menu(message, db, message.from_user.id, bot)
+
+
+@router.message(Command("balance"))
+async def cmd_balance(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
+        return
+    user = await get_user(db, message.from_user.id)
+    balance = user.get("balance", 0) if user else 0
+    bot_settings = await get_settings(db)
+    min_w = bot_settings.get("min_withdraw", 500)
+    await message.answer(
+        f"💰 *Your Balance*\n\n"
+        f"Available: ₦{balance:,.0f}\n"
+        f"Minimum withdrawal: ₦{min_w:,.0f}",
+        reply_markup=back_to_dashboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("referral"))
+async def cmd_referral(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
+        return
     user_id = message.from_user.id
     user = await get_user(db, user_id)
-    if not user or not user.get("onboarded"):
-        await message.answer("Please complete onboarding first. Type /start to begin.")
+    bot_settings = await get_settings(db)
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    ref_reward = bot_settings.get("referral_reward", 100)
+    await message.answer(
+        f"🔗 *Your Referral Link*\n\n"
+        f"`{ref_link}`\n\n"
+        f"Share this link and earn *₦{ref_reward:,.0f}* for every person who joins!\n\n"
+        f"👥 *Your referrals so far:* {user.get('referral_count', 0)}",
+        reply_markup=back_to_dashboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("tasks"))
+async def cmd_tasks(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
         return
-    await show_colourful_menu(message, db, user_id, bot)
+    # Trigger show_tasks callback flow by redirecting
+    await message.answer(
+        "✅ Tap below to view your tasks:",
+        reply_markup=back_to_dashboard()
+    )
+
+
+@router.message(Command("withdraw"))
+async def cmd_withdraw(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
+        return
+    await message.answer(
+        "💸 Use the Withdraw button in your dashboard menu to make a withdrawal.",
+        reply_markup=back_to_dashboard()
+    )
+
+
+@router.message(Command("history"))
+async def cmd_history(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
+        return
+    await message.answer(
+        "📜 Tap below to go to your dashboard and check withdrawal history:",
+        reply_markup=back_to_dashboard()
+    )
+
+
+# ─────────────────────────────────────────
+# DELETE ACCOUNT
+# ─────────────────────────────────────────
+
+@router.callback_query(F.data == "delete_account")
+async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
+    await callback.answer()
+    allowed = await gate_check(callback.message, db, bot)
+    if not allowed:
+        return
+    await callback.message.answer(
+        "🗑️ *Delete My Account*\n\n"
+        "⚠️ This will permanently delete:\n"
+        "• Your balance\n"
+        "• Your referral history\n"
+        "• Your task completions\n"
+        "• Your withdrawal records\n"
+        "• All your data\n\n"
+        "You will start fresh as a new user.\n\n"
+        "*Are you sure?*",
+        reply_markup=confirm_delete_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "confirm_delete")
+async def confirm_delete_account(callback: CallbackQuery, db, bot: Bot):
+    await callback.answer()
+    user_id = callback.from_user.id
+    await delete_user(db, user_id)
+    await callback.message.answer(
+        "✅ *Account deleted successfully.*\n\n"
+        "All your data has been wiped.\n"
+        "Type /start to begin again as a new user.",
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────
