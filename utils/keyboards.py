@@ -1,90 +1,73 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    """Welcome screen proceed button."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Proceed", callback_data="proceed_onboarding")]
+    ])
 
 
 def onboarding_keyboard(tasks: list, show_done: bool = True) -> InlineKeyboardMarkup:
-    """Build the channel join keyboard like MOREMONEE screenshot."""
+    """Build the channel join keyboard."""
     buttons = []
 
-    # Payment/main channel first (red button style — first task)
     if tasks:
         first = tasks[0]
         buttons.append([
-            InlineKeyboardButton(
-                text=f"💸 {first['title']} ↗",
-                url=first["link"]
-            )
+            InlineKeyboardButton(text=f"💸 {first['title']} ↗", url=first["link"])
         ])
 
-    # Rest in 2-column grid
     rest = tasks[1:]
     row = []
-    for i, task in enumerate(rest):
-        row.append(InlineKeyboardButton(
-            text=f"🌐 {task['title']} ↗",
-            url=task["link"]
-        ))
+    for task in rest:
+        row.append(InlineKeyboardButton(text=f"🌐 {task['title']} ↗", url=task["link"]))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
 
-    # Done button
     if show_done:
-        buttons.append([
-            InlineKeyboardButton(text="✅ Done", callback_data="onboarding_done")
-        ])
+        buttons.append([InlineKeyboardButton(text="✅ Done", callback_data="onboarding_done")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def whatsapp_tasks_keyboard(tasks: list) -> InlineKeyboardMarkup:
-    """WhatsApp/extra manual tasks keyboard."""
+    """WhatsApp groups keyboard with I've Joined button."""
     buttons = []
     row = []
-    for i, task in enumerate(tasks):
-        row.append(InlineKeyboardButton(
-            text=f"✅ {task['title']} ↗",
-            url=task["link"]
-        ))
+    for task in tasks:
+        row.append(InlineKeyboardButton(text=f"📱 {task['title']} ↗", url=task["link"]))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
 
-    buttons.append([
-        InlineKeyboardButton(text="⭐ Earn Free CASH", callback_data="extra_tasks_done")
-    ])
+    buttons.append([InlineKeyboardButton(text="✅ I've Joined", callback_data="whatsapp_joined")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def dashboard_keyboard(balance: float, referral_count: int) -> InlineKeyboardMarkup:
-    """Main dashboard after onboarding."""
     buttons = [
         [
             InlineKeyboardButton(text=f"💰 Balance: ₦{balance:,.0f}", callback_data="show_balance"),
             InlineKeyboardButton(text=f"👥 Referrals: {referral_count}", callback_data="show_referrals"),
         ],
-        [
-            InlineKeyboardButton(text="🔗 My Referral Link", callback_data="get_referral_link"),
-        ],
-        [
-            InlineKeyboardButton(text="✅ Tasks", callback_data="show_tasks"),
-        ],
+        [InlineKeyboardButton(text="🔗 My Referral Link", callback_data="get_referral_link")],
+        [InlineKeyboardButton(text="✅ Tasks", callback_data="show_tasks")],
         [
             InlineKeyboardButton(text="💳 Set Bank Account", callback_data="set_bank"),
             InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw"),
         ],
-        [
-            InlineKeyboardButton(text="📜 Withdrawal History", callback_data="withdraw_history"),
-        ],
+        [InlineKeyboardButton(text="📜 Withdrawal History", callback_data="withdraw_history")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def tasks_keyboard(tasks: list, completed_ids: list) -> InlineKeyboardMarkup:
-    """Show available tasks with completion status."""
     buttons = []
     for task in tasks:
         task_id = str(task["_id"])
