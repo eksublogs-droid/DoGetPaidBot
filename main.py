@@ -39,7 +39,12 @@ async def main():
     from aiogram.types import BotCommand
     await bot.set_my_commands([
         BotCommand(command="start", description="Start the bot"),
-        BotCommand(command="menu", description="Open menu"),
+        BotCommand(command="menu", description="Open dashboard menu"),
+        BotCommand(command="balance", description="Check your balance"),
+        BotCommand(command="referral", description="Get your referral link"),
+        BotCommand(command="tasks", description="View available tasks"),
+        BotCommand(command="withdraw", description="Withdraw your funds"),
+        BotCommand(command="history", description="View withdrawal history"),
     ])
 
     logger.info("Bot starting...")
