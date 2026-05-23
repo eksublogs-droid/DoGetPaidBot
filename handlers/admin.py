@@ -32,20 +32,6 @@ class AddTaskStates(StatesGroup):
 
 
 # ─────────────────────────────────────────
-# ADMIN GUARD
-# ─────────────────────────────────────────
-
-def admin_only(func):
-    async def wrapper(message: Message, *args, **kwargs):
-        if not is_admin(message.from_user.id):
-            await message.answer("❌ Admin only.")
-            return
-        return await func(message, *args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-
-# ─────────────────────────────────────────
 # /admin — Admin menu
 # ─────────────────────────────────────────
 
@@ -167,7 +153,7 @@ async def task_reward(message: Message, state: FSMContext):
 
 
 @router.message(AddTaskStates.onboarding)
-async def task_onboarding(message: Message, state: FSMContext):
+async def task_onboarding(message: Message, state: FSMContext, db):
     val = message.text.strip().lower()
     if val not in ["yes", "no"]:
         await message.answer("Send `yes` or `no`:", parse_mode="Markdown")
@@ -185,24 +171,18 @@ async def task_onboarding(message: Message, state: FSMContext):
         )
         await state.set_state(AddTaskStates.channel_id)
     else:
-        await _save_task(message, state)
+        await _save_task(message, state, db)
 
 
 @router.message(AddTaskStates.channel_id)
-async def task_channel_id(message: Message, state: FSMContext):
+async def task_channel_id(message: Message, state: FSMContext, db):
     cid = message.text.strip()
     await state.update_data(channel_id=None if cid == "-" else cid)
-    await _save_task(message, state)
+    await _save_task(message, state, db)
 
 
-async def _save_task(message: Message, state: FSMContext):
+async def _save_task(message: Message, state: FSMContext, db):
     data = await state.get_data()
-    db = message.bot.get("db") or message.__dict__.get("_db")
-
-    # Access db from dispatcher
-    from aiogram import Bot
-    # db is passed via router middleware — access through message
-    # We use a workaround: store in state
     task_data = {
         "title": data["title"],
         "description": data.get("description", ""),
@@ -213,32 +193,13 @@ async def _save_task(message: Message, state: FSMContext):
         "onboarding": data["onboarding"],
         "channel_id": data.get("channel_id")
     }
-    await state.update_data(pending_task=task_data)
-    await message.answer(
-        f"✅ *Task Ready to Save*\n\n"
-        f"Title: {task_data['title']}\n"
-        f"Type: {task_data['task_type']}\n"
-        f"Confirm: {task_data['confirm_type']}\n"
-        f"Reward: ₦{task_data['reward']:,.0f}\n"
-        f"Onboarding: {'Yes' if task_data['onboarding'] else 'No'}\n"
-        f"Link: {task_data['link'] or 'None'}\n\n"
-        f"Send /savetask to confirm or /canceladdtask to abort.",
-        parse_mode="Markdown"
-    )
-
-
-@router.message(Command("savetask"))
-async def save_task_cmd(message: Message, state: FSMContext, db):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    task_data = data.get("pending_task")
-    if not task_data:
-        await message.answer("No task pending. Use /addtask first.")
-        return
     task = await add_task(db, task_data)
     await state.clear()
-    await message.answer(f"✅ Task *{task['title']}* saved! ID: `{task['_id']}`", parse_mode="Markdown")
+    await message.answer(
+        f"✅ Task *{task['title']}* saved!\n"
+        f"ID: `{task['_id']}`",
+        parse_mode="Markdown"
+    )
 
 
 @router.message(Command("canceladdtask"))
@@ -388,7 +349,6 @@ async def broadcast(message: Message, db, bot: Bot):
 
     users = await get_all_users(db)
     sent, failed = 0, 0
-
     await message.answer(f"📡 Broadcasting to {len(users)} users...")
 
     for user in users:
