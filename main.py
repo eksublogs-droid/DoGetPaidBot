@@ -6,6 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 from config.settings import settings
 from handlers import user, admin, tasks, withdrawal
+from utils.keyboards import main_menu_keyboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,13 @@ async def main():
     dp.include_router(tasks.router)
     dp.include_router(withdrawal.router)
     dp.include_router(admin.router)
+
+    # Set bot commands
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Start the bot"),
+        BotCommand(command="menu", description="Open menu"),
+    ])
 
     logger.info("Bot starting...")
     await dp.start_polling(bot, skip_updates=True)
