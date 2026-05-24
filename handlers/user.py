@@ -32,14 +32,6 @@ _captcha_tasks: dict[int, asyncio.Task] = {}
 CAPTCHA_TIMEOUT = 20        # seconds user has to answer captcha
 SPEED_FLAG_THRESHOLD = 5    # flag if onboarding completed in under this many seconds
 
-# Only these Telegram user IDs may delete their own account.
-# Replace the zeros with the real IDs of +2348137890167 and +2348104797770.
-# (Have each person message the bot — their ID appears in the admin notification.)
-SELF_DELETE_ALLOWED_IDS: set[int] = {
-    1794483261,   # +2348137890167 (@EksuBlog)
-    6511973707,   # +2348104797770 (@PDANWEALTH)
-}
-
 
 # ─────────────────────────────────────────
 # FSM STATES
@@ -342,7 +334,10 @@ async def admin_action_deductbal(callback: CallbackQuery, db, state: FSMContext)
 async def admin_balance_amount_input(message: Message, db, bot: Bot, state: FSMContext):
     """Receive the amount from admin after tapping Add/Deduct Balance."""
     if not _is_admin(message.from_user.id):
+        # Should never happen — but if state is stuck, clear it and tell user to retry
         await state.clear()
+        if message.text and message.text.startswith("/"):
+            await message.answer("⚠️ Something went wrong. Please try your command again.")
         return
 
     raw = message.text.strip().replace(",", "").replace("₦", "")
@@ -887,9 +882,6 @@ async def cmd_history(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "delete_account")
 async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
-    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
-        await callback.message.answer("⛔ Account deletion is not available for your account.")
-        return
     await callback.message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -907,9 +899,6 @@ async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
 
 @router.message(Command("removemyaccount"))
 async def cmd_remove_account(message: Message, db, bot: Bot):
-    if message.from_user.id not in SELF_DELETE_ALLOWED_IDS:
-        await message.answer("⛔ Account deletion is not available for your account.")
-        return
     await message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -928,9 +917,6 @@ async def cmd_remove_account(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "confirm_delete")
 async def confirm_delete_account(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
-    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
-        await callback.message.answer("⛔ Account deletion is not available for your account.")
-        return
     user_id = callback.from_user.id
     await delete_user(db, user_id)
     await callback.message.answer(
