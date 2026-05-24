@@ -48,11 +48,39 @@ def bank_selection_keyboard():
 # SET BANK ACCOUNT
 # ─────────────────────────────────────────
 
+def _change_bank_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Change Bank Account", callback_data="set_bank_proceed")],
+        [InlineKeyboardButton(text="🔙 Back to Dashboard", callback_data="dashboard")],
+    ])
+
+
 @router.callback_query(F.data == "set_bank")
-async def set_bank_start(callback: CallbackQuery, state: FSMContext):
+async def set_bank_start(callback: CallbackQuery, state: FSMContext, db):
     await callback.answer()
+    user = await get_user(db, callback.from_user.id)
+    if user and user.get("bank_account"):
+        await callback.message.answer(
+            f"💳 *Your Current Bank Account*\n\n"
+            f"Bank: *{user['bank_name']}*\n"
+            f"Account: *{user['bank_account']}*\n\n"
+            f"Do you want to change it?",
+            reply_markup=_change_bank_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
     await callback.message.answer(
         "💳 *Set Your Bank Account*\n\nSelect your bank:",
+        reply_markup=bank_selection_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "set_bank_proceed")
+async def set_bank_proceed(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "💳 *Change Bank Account*\n\nSelect your new bank:",
         reply_markup=bank_selection_keyboard(),
         parse_mode="Markdown"
     )
