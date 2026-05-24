@@ -20,6 +20,11 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.ADMIN_IDS
 
 
+def _is_command(text: str) -> bool:
+    """Returns True if message is a command — lets FSM steps escape cleanly."""
+    return text is not None and text.startswith("/")
+
+
 class AddTaskStates(StatesGroup):
     title = State()
     description = State()
@@ -36,10 +41,10 @@ class AddTaskStates(StatesGroup):
 # ─────────────────────────────────────────
 
 @router.message(Command("admin"))
-async def admin_menu(message: Message):
+async def admin_menu(message: Message, state: FSMContext):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
-
     await message.answer(
         "🛠 *Admin Panel*\n\n"
         "*Task Management:*\n"
@@ -71,12 +76,23 @@ async def admin_menu(message: Message):
 async def add_task_start(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    await state.clear()
     await message.answer("📋 *Add New Task*\n\nTask title:", parse_mode="Markdown")
     await state.set_state(AddTaskStates.title)
 
 
+@router.message(Command("canceladdtask"))
+async def cancel_add_task(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Task creation cancelled.")
+
+
 @router.message(AddTaskStates.title)
 async def task_title(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     await state.update_data(title=message.text.strip())
     await message.answer("Description (or send `-` to skip):")
     await state.set_state(AddTaskStates.description)
@@ -84,6 +100,10 @@ async def task_title(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.description)
 async def task_description(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     desc = message.text.strip()
     await state.update_data(description="" if desc == "-" else desc)
     await message.answer("Link/URL for the task (or `-` if none):")
@@ -92,6 +112,10 @@ async def task_description(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.link)
 async def task_link(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     link = message.text.strip()
     await state.update_data(link="" if link == "-" else link)
     await message.answer(
@@ -109,6 +133,10 @@ async def task_link(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.task_type)
 async def task_type_handler(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     valid = ["join_channel", "join_group", "whatsapp", "visit_link", "custom"]
     t = message.text.strip().lower()
     if t not in valid:
@@ -127,6 +155,10 @@ async def task_type_handler(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.confirm_type)
 async def task_confirm_type(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     ct = message.text.strip().lower()
     if ct not in ["auto", "manual"]:
         await message.answer("Send `auto` or `manual`:", parse_mode="Markdown")
@@ -138,6 +170,10 @@ async def task_confirm_type(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.reward)
 async def task_reward(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     try:
         reward = float(message.text.strip().replace(",", ""))
     except ValueError:
@@ -154,6 +190,10 @@ async def task_reward(message: Message, state: FSMContext):
 
 @router.message(AddTaskStates.onboarding)
 async def task_onboarding(message: Message, state: FSMContext, db):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     val = message.text.strip().lower()
     if val not in ["yes", "no"]:
         await message.answer("Send `yes` or `no`:", parse_mode="Markdown")
@@ -176,6 +216,10 @@ async def task_onboarding(message: Message, state: FSMContext, db):
 
 @router.message(AddTaskStates.channel_id)
 async def task_channel_id(message: Message, state: FSMContext, db):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Task creation cancelled. Run /addtask to start again.")
+        return
     cid = message.text.strip()
     await state.update_data(channel_id=None if cid == "-" else cid)
     await _save_task(message, state, db)
@@ -202,18 +246,13 @@ async def _save_task(message: Message, state: FSMContext, db):
     )
 
 
-@router.message(Command("canceladdtask"))
-async def cancel_add_task(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Task creation cancelled.")
-
-
 # ─────────────────────────────────────────
 # LIST TASKS
 # ─────────────────────────────────────────
 
 @router.message(Command("listtasks"))
-async def list_tasks(message: Message, db):
+async def list_tasks(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     tasks = await get_all_tasks(db)
@@ -239,7 +278,8 @@ async def list_tasks(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("deltask"))
-async def del_task(message: Message, db):
+async def del_task(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -256,7 +296,8 @@ async def del_task(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("setminwithdraw"))
-async def set_min_withdraw(message: Message, db):
+async def set_min_withdraw(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -272,7 +313,8 @@ async def set_min_withdraw(message: Message, db):
 
 
 @router.message(Command("setreferralreward"))
-async def set_referral_reward(message: Message, db):
+async def set_referral_reward(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -288,7 +330,8 @@ async def set_referral_reward(message: Message, db):
 
 
 @router.message(Command("setrewardpool"))
-async def set_reward_pool(message: Message, db):
+async def set_reward_pool(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -308,7 +351,8 @@ async def set_reward_pool(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("stats"))
-async def stats(message: Message, db):
+async def stats(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
 
@@ -339,7 +383,8 @@ async def stats(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("broadcast"))
-async def broadcast(message: Message, db, bot: Bot):
+async def broadcast(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     text = message.text.replace("/broadcast", "", 1).strip()
@@ -366,7 +411,8 @@ async def broadcast(message: Message, db, bot: Bot):
 # ─────────────────────────────────────────
 
 @router.message(Command("ban"))
-async def ban_user(message: Message, db):
+async def ban_user(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -379,7 +425,8 @@ async def ban_user(message: Message, db):
 
 
 @router.message(Command("unban"))
-async def unban_user(message: Message, db):
+async def unban_user(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -396,7 +443,8 @@ async def unban_user(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("addbalance"))
-async def add_balance(message: Message, db, bot: Bot):
+async def add_balance(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     parts = message.text.split()
@@ -422,7 +470,8 @@ async def add_balance(message: Message, db, bot: Bot):
 # ─────────────────────────────────────────
 
 @router.message(Command("pendingwithdrawals"))
-async def pending_withdrawals(message: Message, db):
+async def pending_withdrawals(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     pending = await get_pending_withdrawals(db)
@@ -448,7 +497,8 @@ async def pending_withdrawals(message: Message, db):
 # ─────────────────────────────────────────
 
 @router.message(Command("pendingtasks"))
-async def pending_tasks(message: Message, db):
+async def pending_tasks(message: Message, state: FSMContext, db):
+    await state.clear()
     if not is_admin(message.from_user.id):
         return
     pending = await get_pending_completions(db)
