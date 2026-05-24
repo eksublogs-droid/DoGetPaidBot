@@ -13,7 +13,8 @@ from models.db import (
     update_user_balance, increment_referral_count,
     get_onboarding_tasks, get_user_completions, delete_user,
     set_captcha_answer, clear_captcha_answer,
-    ban_user, unban_user, set_user_balance, count_all_users
+    ban_user, unban_user, set_user_balance, count_all_users,
+    get_referral_leaderboard
 )
 from utils.keyboards import (
     welcome_keyboard, onboarding_keyboard,
@@ -1013,6 +1014,47 @@ async def show_referrals(callback: CallbackQuery, db, bot: Bot):
         f"Total referrals: *{ref_count}*\n"
         f"Earned from referrals: *₦{total_earned:,.0f}*\n\n"
         f"🔗 Your link:\n`{ref_link}`",
+        reply_markup=back_to_dashboard(),
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────
+# /myid — show user's Telegram ID
+# ─────────────────────────────────────────
+
+@router.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.answer(
+        f"🪪 Your Telegram ID: `{message.from_user.id}`",
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────
+# /leaderboard — top 10 referrers (user-facing)
+# ─────────────────────────────────────────
+
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(message: Message, db, bot: Bot):
+    allowed = await gate_check(message, db, bot)
+    if not allowed:
+        return
+    top = await get_referral_leaderboard(db, limit=10)
+    if not top:
+        await message.answer(
+            "📊 No referrals yet — be the first to share your link!",
+            reply_markup=back_to_dashboard()
+        )
+        return
+    lines = ["🏆 *Referral Leaderboard — Top 10*\n"]
+    my_id = message.from_user.id
+    for i, u in enumerate(top, 1):
+        uname = f"@{u['username']}" if u.get("username") else f"User {u['telegram_id']}"
+        marker = " 👈 you" if u["telegram_id"] == my_id else ""
+        lines.append(f"{i}. {uname} — {u['referral_count']} referral(s){marker}")
+    await message.answer(
+        "\n".join(lines),
         reply_markup=back_to_dashboard(),
         parse_mode="Markdown"
     )
