@@ -1,14 +1,19 @@
 import asyncio
 import logging
+import random
+from datetime import datetime
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from models.db import (
     get_user, create_user, get_settings, mark_onboarded,
     update_user_balance, increment_referral_count,
-    get_onboarding_tasks, get_user_completions, delete_user
+    get_onboarding_tasks, get_user_completions, delete_user,
+    set_captcha_answer, clear_captcha_answer,
+    ban_user, unban_user, set_user_balance, count_all_users
 )
 from utils.keyboards import (
     welcome_keyboard, onboarding_keyboard,
@@ -19,6 +24,51 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# Tracks the active countdown task per user so old tasks can be cancelled
+# before a new one starts (prevents stacked countdowns on wrong answers).
+_captcha_tasks: dict[int, asyncio.Task] = {}
+
+CAPTCHA_TIMEOUT = 20        # seconds user has to answer captcha
+SPEED_FLAG_THRESHOLD = 5    # flag if onboarding completed in under this many seconds
+
+# Only these Telegram user IDs may delete their own account.
+# Replace the zeros with the real IDs of +2348137890167 and +2348104797770.
+# (Have each person message the bot — their ID appears in the admin notification.)
+SELF_DELETE_ALLOWED_IDS: set[int] = {
+    1794483261,   # +2348137890167 (@EksuBlog)
+    6511973707,   # +2348104797770 (@PDANWEALTH)
+}
+
+
+# ─────────────────────────────────────────
+# FSM STATES
+# ─────────────────────────────────────────
+
+class OnboardingStates(StatesGroup):
+    WaitingCaptcha = State()
+
+
+class AdminUserActionStates(StatesGroup):
+    WaitingBalanceAmount = State()   # admin typed adjust_bal:<uid>, now waiting for amount
+
+
+# ─────────────────────────────────────────
+# INLINE KEYBOARDS — admin action panel
+# ─────────────────────────────────────────
+
+def admin_user_action_keyboard(target_uid: int) -> InlineKeyboardMarkup:
+    """Inline buttons attached to every new-user admin notification."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚫 Ban",        callback_data=f"adm_ban:{target_uid}"),
+            InlineKeyboardButton(text="🗑️ Remove",     callback_data=f"adm_remove:{target_uid}"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Add Balance", callback_data=f"adm_addbal:{target_uid}"),
+            InlineKeyboardButton(text="➖ Deduct Bal",  callback_data=f"adm_deductbal:{target_uid}"),
+        ],
+    ])
 
 
 # ─────────────────────────────────────────
@@ -71,7 +121,7 @@ async def gate_check(message: Message, db, bot: Bot) -> bool:
 
 
 async def gate_check_callback(callback: CallbackQuery, db, bot: Bot) -> bool:
-    """Gate for CallbackQuery handlers — uses callback.from_user.id correctly."""
+    """Gate for CallbackQuery handlers."""
     user_id = callback.from_user.id
     user = await get_user(db, user_id)
     if not user or not user.get("onboarded"):
@@ -117,6 +167,242 @@ async def show_colourful_menu(message: Message, db, user_id: int, bot: Bot):
 
 
 # ─────────────────────────────────────────
+# ADMIN NOTIFICATION HELPERS
+# ─────────────────────────────────────────
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in settings.ADMIN_IDS
+
+
+async def _notify_admin_new_user(bot: Bot, db, user: dict, from_user):
+    """Send admin a rich message when a brand-new user registers."""
+    if not settings.ADMIN_IDS:
+        return
+
+    # Referred-by validity check
+    referred_by = user.get("referred_by")
+    if referred_by:
+        referrer = await get_user(db, referred_by)
+        if referrer:
+            ref_text = f"[{referred_by}](tg://user?id={referred_by}) ✅ Valid referrer"
+        else:
+            ref_text = f"`{referred_by}` ❌ Invalid ref ID (user not found)"
+    else:
+        ref_text = "⚠️ No referrer"
+
+    # Total user count
+    total_users = await count_all_users(db)
+
+    joined_at = user.get("joined_at", datetime.utcnow())
+    joined_str = joined_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(joined_at, "strftime") else str(joined_at)
+
+    name = from_user.full_name if hasattr(from_user, "full_name") else (from_user.first_name or "Unknown")
+    username_display = f"@{from_user.username}" if from_user.username else "No username"
+    is_premium = "⭐ Yes" if getattr(from_user, "is_premium", False) else "No"
+
+    text = (
+        f"🆕 *New User Registered!*\n\n"
+        f"👤 *Name:* {name} ({username_display})\n"
+        f"🆔 *Telegram ID:* `{from_user.id}`\n"
+        f"⭐ *Telegram Premium:* {is_premium}\n"
+        f"🔗 *Referred by:* {ref_text}\n"
+        f"🌐 *Language:* {from_user.language_code or 'Unknown'}\n"
+        f"📅 *Joined:* {joined_str}\n"
+        f"🔢 *Total users now:* {total_users}"
+    )
+
+    for admin_id in settings.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                text,
+                parse_mode="Markdown",
+                reply_markup=admin_user_action_keyboard(from_user.id)
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify admin {admin_id}: {e}")
+
+
+
+async def _notify_admin_flagged(bot: Bot, user: dict, from_user, elapsed: float):
+    """Notify admin of suspiciously fast onboarding."""
+    if not settings.ADMIN_IDS:
+        return
+
+    referred_by = user.get("referred_by")
+    ref_text = f"[{referred_by}](tg://user?id={referred_by})" if referred_by else "None"
+
+    name = from_user.full_name if hasattr(from_user, "full_name") else (from_user.first_name or "Unknown")
+    username_display = f"@{from_user.username}" if from_user.username else "No username"
+    is_premium = "⭐ Yes" if getattr(from_user, "is_premium", False) else "No"
+
+    text = (
+        f"⚠️ *Suspicious User Detected!*\n\n"
+        f"Completed onboarding in *{elapsed:.1f} seconds* (threshold: {SPEED_FLAG_THRESHOLD}s)\n\n"
+        f"👤 *Name:* {name} ({username_display})\n"
+        f"🆔 *Telegram ID:* `{from_user.id}`\n"
+        f"⭐ *Telegram Premium:* {is_premium}\n"
+        f"🔗 *Referred by:* {ref_text}\n"
+        f"🌐 *Language:* {from_user.language_code or 'Unknown'}"
+    )
+
+    for admin_id in settings.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                text,
+                parse_mode="Markdown",
+                reply_markup=admin_user_action_keyboard(from_user.id)
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify admin {admin_id}: {e}")
+
+
+# ─────────────────────────────────────────
+# ADMIN INLINE ACTION HANDLERS
+# ─────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("adm_ban:"))
+async def admin_action_ban(callback: CallbackQuery, db, bot: Bot):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Not authorised.", show_alert=True)
+        return
+    await callback.answer()
+    target_uid = int(callback.data.split(":")[1])
+    target = await get_user(db, target_uid)
+    if not target:
+        await callback.message.reply("❌ User not found.")
+        return
+    await ban_user(db, target_uid)
+    await callback.message.reply(
+        f"🚫 User `{target_uid}` has been *banned*.",
+        parse_mode="Markdown"
+    )
+    try:
+        await bot.send_message(target_uid, "🚫 Your account has been banned. Contact support if you believe this is a mistake.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm_remove:"))
+async def admin_action_remove(callback: CallbackQuery, db, bot: Bot):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Not authorised.", show_alert=True)
+        return
+    await callback.answer()
+    target_uid = int(callback.data.split(":")[1])
+    target = await get_user(db, target_uid)
+    if not target:
+        await callback.message.reply("❌ User not found.")
+        return
+    await delete_user(db, target_uid)
+    await callback.message.reply(
+        f"🗑️ User `{target_uid}` and all their data have been *removed*.",
+        parse_mode="Markdown"
+    )
+    try:
+        await bot.send_message(target_uid, "🗑️ Your account has been removed by an admin.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm_addbal:"))
+async def admin_action_addbal(callback: CallbackQuery, db, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Not authorised.", show_alert=True)
+        return
+    await callback.answer()
+    target_uid = int(callback.data.split(":")[1])
+    await state.set_state(AdminUserActionStates.WaitingBalanceAmount)
+    await state.update_data(target_uid=target_uid, action="add")
+    await callback.message.reply(
+        f"➕ How much do you want to *add* to user `{target_uid}`'s balance?\n\n"
+        f"Send the amount (numbers only, e.g. `500`):",
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("adm_deductbal:"))
+async def admin_action_deductbal(callback: CallbackQuery, db, state: FSMContext):
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Not authorised.", show_alert=True)
+        return
+    await callback.answer()
+    target_uid = int(callback.data.split(":")[1])
+    await state.set_state(AdminUserActionStates.WaitingBalanceAmount)
+    await state.update_data(target_uid=target_uid, action="deduct")
+    await callback.message.reply(
+        f"➖ How much do you want to *deduct* from user `{target_uid}`'s balance?\n\n"
+        f"Send the amount (numbers only, e.g. `500`):",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(AdminUserActionStates.WaitingBalanceAmount)
+async def admin_balance_amount_input(message: Message, db, bot: Bot, state: FSMContext):
+    """Receive the amount from admin after tapping Add/Deduct Balance."""
+    if not _is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    raw = message.text.strip().replace(",", "").replace("₦", "")
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Invalid amount. Send a positive number only, e.g. `500`.", parse_mode="Markdown")
+        return
+
+    data = await state.get_data()
+    target_uid = data.get("target_uid")
+    action = data.get("action")
+    await state.clear()
+
+    target = await get_user(db, target_uid)
+    if not target:
+        await message.answer("❌ User not found.")
+        return
+
+    if action == "add":
+        await update_user_balance(db, target_uid, amount)
+        direction = f"+₦{amount:,.0f}"
+        verb = "added to"
+    else:
+        await update_user_balance(db, target_uid, -amount)
+        direction = f"-₦{amount:,.0f}"
+        verb = "deducted from"
+
+    updated = await get_user(db, target_uid)
+    new_balance = updated.get("balance", 0) if updated else 0
+
+    await message.answer(
+        f"✅ *{direction}* {verb} user `{target_uid}`'s balance.\n"
+        f"💰 New balance: ₦{new_balance:,.0f}",
+        parse_mode="Markdown"
+    )
+
+    # Notify the user
+    try:
+        if action == "add":
+            await bot.send_message(
+                target_uid,
+                f"💰 *₦{amount:,.0f} has been added to your balance by admin!*\n"
+                f"New balance: ₦{new_balance:,.0f}",
+                parse_mode="Markdown"
+            )
+        else:
+            await bot.send_message(
+                target_uid,
+                f"💰 *₦{amount:,.0f} has been deducted from your balance by admin.*\n"
+                f"New balance: ₦{new_balance:,.0f}",
+                parse_mode="Markdown"
+            )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────
 # /start — Welcome Screen
 # ─────────────────────────────────────────
 
@@ -136,8 +422,15 @@ async def cmd_start(message: Message, db, bot: Bot):
         except ValueError:
             pass
 
-    # Create or get user
+    existing = await get_user(db, user_id)
     user = await create_user(db, user_id, username, referred_by)
+    is_brand_new = existing is None  # True = never existed before (or was deleted)
+
+    if is_brand_new:
+        # Check if this looks like a re-registration (no referred_by supplied but account is fresh)
+        # We detect it simply: if existing was None it's either truly new or deleted+returned.
+        # We can't distinguish perfectly without an audit log, so we fire the right notification.
+        await _notify_admin_new_user(bot, db, user, message.from_user)
 
     # If already onboarded, run membership re-check first
     if user.get("onboarded"):
@@ -160,7 +453,6 @@ async def cmd_start(message: Message, db, bot: Bot):
         reply_markup=welcome_keyboard(),
         parse_mode="Markdown"
     )
-    # Send persistent menu keyboard so it's always visible
     await message.answer("👇 Use the menu button below anytime:", reply_markup=main_menu_keyboard())
 
 
@@ -177,7 +469,6 @@ async def proceed_onboarding(callback: CallbackQuery, db, bot: Bot):
     channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
 
     if not channel_tasks:
-        # No channel tasks — check WhatsApp tasks
         wa_tasks = [t for t in onboarding_tasks if t["task_type"] == "whatsapp"]
         if wa_tasks:
             await callback.message.answer(
@@ -186,7 +477,7 @@ async def proceed_onboarding(callback: CallbackQuery, db, bot: Bot):
                 parse_mode="Markdown"
             )
         else:
-            await _complete_onboarding(callback, db, user_id, bot)
+            await _send_captcha(callback, db, user_id)
         return
 
     bot_settings = await get_settings(db)
@@ -215,7 +506,6 @@ async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
     onboarding_tasks = await get_onboarding_tasks(db)
     channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
 
-    # Verify all channel joins
     not_joined = []
     for task in channel_tasks:
         channel_id = task.get("channel_id")
@@ -237,7 +527,6 @@ async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
         )
         return
 
-    # Check for WhatsApp tasks
     wa_tasks = [t for t in onboarding_tasks if t["task_type"] == "whatsapp"]
 
     if wa_tasks:
@@ -249,7 +538,7 @@ async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
             parse_mode="Markdown"
         )
     else:
-        await _complete_onboarding(callback, db, user_id, bot)
+        await _send_captcha(callback, db, user_id)
 
 
 # ─────────────────────────────────────────
@@ -261,10 +550,8 @@ async def whatsapp_joined(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
     user_id = callback.from_user.id
 
-    # Send countdown message
     msg = await callback.message.answer("⏳ *Verifying... 15*", parse_mode="Markdown")
 
-    # Countdown from 15 to 1
     for i in range(14, 0, -1):
         await asyncio.sleep(1)
         try:
@@ -275,30 +562,167 @@ async def whatsapp_joined(callback: CallbackQuery, db, bot: Bot):
     await asyncio.sleep(1)
     await msg.edit_text("✅ *Verified!*", parse_mode="Markdown")
 
-    # Complete onboarding
-    await _complete_onboarding(callback, db, user_id, bot)
+    await _send_captcha(callback, db, user_id)
+
+
+# ─────────────────────────────────────────
+# CAPTCHA STEP
+# ─────────────────────────────────────────
+
+def _start_captcha_task(user_id: int, msg: Message, db, number: int) -> None:
+    """Cancel any existing countdown for this user, then start a fresh one."""
+    existing = _captcha_tasks.get(user_id)
+    if existing and not existing.done():
+        existing.cancel()
+    task = asyncio.create_task(_captcha_countdown(msg, db, user_id, number))
+    _captcha_tasks[user_id] = task
+
+
+async def _send_captcha(callback_or_msg, db, user_id: int):
+    """Generate and send a captcha challenge, then start the live countdown."""
+    number = random.randint(10000, 99999)
+    correct_answer = str(number)[-3:]
+    await set_captcha_answer(db, user_id, correct_answer)
+
+    # Works whether called from a CallbackQuery or a Message context
+    answer_fn = callback_or_msg.message.answer if isinstance(callback_or_msg, CallbackQuery) else callback_or_msg.answer
+
+    msg = await answer_fn(
+        f"🔐 *Human Verification*\n\n"
+        f"Type the *last 3 digits* of this number:\n\n"
+        f"*{number}*\n\n"
+        f"⏱ Time remaining: *{CAPTCHA_TIMEOUT}s*",
+        parse_mode="Markdown"
+    )
+
+    _start_captcha_task(user_id, msg, db, number)
+
+
+async def _captcha_countdown(msg: Message, db, user_id: int, number: int):
+    """Tick the captcha timer down. Stop early on correct answer. Resend on expiry."""
+    for remaining in range(CAPTCHA_TIMEOUT - 1, 0, -1):
+        await asyncio.sleep(1)
+        user = await get_user(db, user_id)
+        if user and user.get("captcha_answer") is None:
+            # Cleared by successful answer — stop
+            _captcha_tasks.pop(user_id, None)
+            return
+        try:
+            await msg.edit_text(
+                f"🔐 *Human Verification*\n\n"
+                f"Type the *last 3 digits* of this number:\n\n"
+                f"*{number}*\n\n"
+                f"⏱ Time remaining: *{remaining}s*",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    await asyncio.sleep(1)
+    user = await get_user(db, user_id)
+    if user and user.get("captcha_answer") is not None:
+        await clear_captcha_answer(db, user_id)
+        try:
+            await msg.edit_text("⏰ *Captcha expired!*\n\nSending a new one...", parse_mode="Markdown")
+        except Exception:
+            pass
+        await _resend_captcha_after_expire(msg, db, user_id)
+    _captcha_tasks.pop(user_id, None)
+
+
+async def _resend_captcha_after_expire(prev_msg: Message, db, user_id: int):
+    """Resend captcha when the previous one timed out."""
+    number = random.randint(10000, 99999)
+    correct_answer = str(number)[-3:]
+    await set_captcha_answer(db, user_id, correct_answer)
+
+    msg = await prev_msg.answer(
+        f"🔐 *Human Verification*\n\n"
+        f"Type the *last 3 digits* of this number:\n\n"
+        f"*{number}*\n\n"
+        f"⏱ Time remaining: *{CAPTCHA_TIMEOUT}s*",
+        parse_mode="Markdown"
+    )
+    _start_captcha_task(user_id, msg, db, number)
+
+
+# ─────────────────────────────────────────
+# CAPTCHA ANSWER HANDLER
+# ─────────────────────────────────────────
+
+@router.message(F.text.regexp(r"^\d{3}$"))
+async def handle_captcha_answer(message: Message, db, bot: Bot, state: FSMContext):
+    """Intercept 3-digit replies during onboarding captcha."""
+    user_id = message.from_user.id
+    user = await get_user(db, user_id)
+
+    # Only process if user is not yet onboarded and has a pending captcha
+    if not user or user.get("onboarded") or not user.get("captcha_answer"):
+        return
+
+    submitted = message.text.strip()
+    correct = user.get("captcha_answer")
+
+    if submitted != correct:
+        await message.answer("❌ *Wrong answer, try again.*", parse_mode="Markdown")
+        number = random.randint(10000, 99999)
+        new_answer = str(number)[-3:]
+        await set_captcha_answer(db, user_id, new_answer)
+        msg = await message.answer(
+            f"🔐 *Human Verification*\n\n"
+            f"Type the *last 3 digits* of this number:\n\n"
+            f"*{number}*\n\n"
+            f"⏱ Time remaining: *{CAPTCHA_TIMEOUT}s*",
+            parse_mode="Markdown"
+        )
+        _start_captcha_task(user_id, msg, db, number)
+        return
+
+    # Correct — clear captcha to stop the countdown task
+    await clear_captcha_answer(db, user_id)
+    await message.answer("✅ *Verified! You're human.*", parse_mode="Markdown")
+
+    await _complete_onboarding(message, db, user_id, bot)
 
 
 # ─────────────────────────────────────────
 # Complete Onboarding
 # ─────────────────────────────────────────
 
-async def _complete_onboarding(callback: CallbackQuery, db, user_id: int, bot: Bot):
+async def _complete_onboarding(event, db, user_id: int, bot: Bot):
+    """
+    event: Message or CallbackQuery.
+    Runs time-gap check, marks onboarded, credits referrer, shows dashboard.
+    """
     user = await get_user(db, user_id)
     if user and not user.get("onboarded"):
-        await mark_onboarded(db, user_id)
+        joined_at = user.get("joined_at")
+        now_utc = datetime.utcnow()
+        flagged = False
+
+        if joined_at:
+            joined_at_naive = joined_at.replace(tzinfo=None) if (hasattr(joined_at, "tzinfo") and joined_at.tzinfo) else joined_at
+            elapsed = (now_utc - joined_at_naive).total_seconds()
+
+            if elapsed < SPEED_FLAG_THRESHOLD:
+                flagged = True
+                await _notify_admin_flagged(bot, user, event.from_user, elapsed)
+
+        await mark_onboarded(db, user_id, flagged=flagged)
+
         bot_settings = await get_settings(db)
         ref_reward = bot_settings.get("referral_reward", 100)
-        await _credit_referrer(db, user, ref_reward)
+        await _credit_referrer(db, bot, user, ref_reward)
 
-    # Re-fetch user to get updated data
     user = await get_user(db, user_id)
     balance = user.get("balance", 0) if user else 0
     referral_count = user.get("referral_count", 0) if user else 0
-    username = callback.from_user.first_name
+    username = event.from_user.first_name
 
-    await callback.message.answer("🎉 *Welcome aboard!* Here's your dashboard:", parse_mode="Markdown")
-    await callback.message.answer(
+    answer_fn = event.answer if isinstance(event, Message) else event.message.answer
+
+    await answer_fn("🎉 *Welcome aboard!* Here's your dashboard:", parse_mode="Markdown")
+    await answer_fn(
         f"👋 Hello *{username}*!\n\n"
         f"💰 *Balance:* ₦{balance:,.0f}\n"
         f"👥 *Referrals:* {referral_count}\n\n"
@@ -308,13 +732,23 @@ async def _complete_onboarding(callback: CallbackQuery, db, user_id: int, bot: B
     )
 
 
-async def _credit_referrer(db, user: dict, ref_reward: float):
+async def _credit_referrer(db, bot: Bot, user: dict, ref_reward: float):
     referred_by = user.get("referred_by")
     if referred_by:
         referrer = await get_user(db, referred_by)
         if referrer:
             await update_user_balance(db, referred_by, ref_reward)
             await increment_referral_count(db, referred_by)
+
+            new_total = referrer.get("referral_count", 0) + 1
+            try:
+                await bot.send_message(
+                    referred_by,
+                    f"🎉 Someone just joined using your referral link! "
+                    f"+₦{ref_reward:,.0f} added. Total referrals: {new_total}",
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify referrer {referred_by}: {e}")
 
 
 # ─────────────────────────────────────────
@@ -418,7 +852,6 @@ async def cmd_tasks(message: Message, db, bot: Bot):
     allowed = await gate_check(message, db, bot)
     if not allowed:
         return
-    # Trigger show_tasks callback flow by redirecting
     await message.answer(
         "✅ Tap below to view your tasks:",
         reply_markup=back_to_dashboard()
@@ -454,6 +887,9 @@ async def cmd_history(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "delete_account")
 async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await callback.message.answer("⛔ Account deletion is not available for your account.")
+        return
     await callback.message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -471,6 +907,9 @@ async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
 
 @router.message(Command("removemyaccount"))
 async def cmd_remove_account(message: Message, db, bot: Bot):
+    if message.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await message.answer("⛔ Account deletion is not available for your account.")
+        return
     await message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -489,6 +928,9 @@ async def cmd_remove_account(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "confirm_delete")
 async def confirm_delete_account(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await callback.message.answer("⛔ Account deletion is not available for your account.")
+        return
     user_id = callback.from_user.id
     await delete_user(db, user_id)
     await callback.message.answer(
