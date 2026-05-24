@@ -186,7 +186,7 @@ async def proceed_onboarding(callback: CallbackQuery, db, bot: Bot):
                 parse_mode="Markdown"
             )
         else:
-            await _complete_onboarding(callback.message, db, user_id)
+            await _complete_onboarding(callback, db, user_id, bot)
         return
 
     bot_settings = await get_settings(db)
@@ -249,7 +249,7 @@ async def onboarding_done(callback: CallbackQuery, db, bot: Bot):
             parse_mode="Markdown"
         )
     else:
-        await _complete_onboarding(callback.message, db, user_id)
+        await _complete_onboarding(callback, db, user_id, bot)
 
 
 # ─────────────────────────────────────────
@@ -276,14 +276,14 @@ async def whatsapp_joined(callback: CallbackQuery, db, bot: Bot):
     await msg.edit_text("✅ *Verified!*", parse_mode="Markdown")
 
     # Complete onboarding
-    await _complete_onboarding(callback.message, db, user_id)
+    await _complete_onboarding(callback, db, user_id, bot)
 
 
 # ─────────────────────────────────────────
 # Complete Onboarding
 # ─────────────────────────────────────────
 
-async def _complete_onboarding(message: Message, db, user_id: int):
+async def _complete_onboarding(callback: CallbackQuery, db, user_id: int, bot: Bot):
     user = await get_user(db, user_id)
     if user and not user.get("onboarded"):
         await mark_onboarded(db, user_id)
@@ -291,8 +291,21 @@ async def _complete_onboarding(message: Message, db, user_id: int):
         ref_reward = bot_settings.get("referral_reward", 100)
         await _credit_referrer(db, user, ref_reward)
 
-    await message.answer("🎉 *Welcome aboard!* Here's your dashboard:", parse_mode="Markdown")
-    await show_dashboard(message, db, user_id)
+    # Re-fetch user to get updated data
+    user = await get_user(db, user_id)
+    balance = user.get("balance", 0) if user else 0
+    referral_count = user.get("referral_count", 0) if user else 0
+    username = callback.from_user.first_name
+
+    await callback.message.answer("🎉 *Welcome aboard!* Here's your dashboard:", parse_mode="Markdown")
+    await callback.message.answer(
+        f"👋 Hello *{username}*!\n\n"
+        f"💰 *Balance:* ₦{balance:,.0f}\n"
+        f"👥 *Referrals:* {referral_count}\n\n"
+        f"What would you like to do?",
+        reply_markup=colourful_dashboard_keyboard(balance, referral_count),
+        parse_mode="Markdown"
+    )
 
 
 async def _credit_referrer(db, user: dict, ref_reward: float):
