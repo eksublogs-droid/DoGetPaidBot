@@ -32,6 +32,12 @@ _captcha_tasks: dict[int, asyncio.Task] = {}
 CAPTCHA_TIMEOUT = 20        # seconds user has to answer captcha
 SPEED_FLAG_THRESHOLD = 5    # flag if onboarding completed in under this many seconds
 
+# Only these 2 Telegram user IDs may delete their own account.
+SELF_DELETE_ALLOWED_IDS: set[int] = {
+    1794483261,   # +2348137890167 (@EksuBlog)
+    6511973707,   # +2348104797770 (@PDANWEALTH)
+}
+
 
 # ─────────────────────────────────────────
 # FSM STATES
@@ -422,10 +428,10 @@ async def cmd_start(message: Message, db, bot: Bot):
     is_brand_new = existing is None  # True = never existed before (or was deleted)
 
     if is_brand_new:
-        # Check if this looks like a re-registration (no referred_by supplied but account is fresh)
-        # We detect it simply: if existing was None it's either truly new or deleted+returned.
-        # We can't distinguish perfectly without an audit log, so we fire the right notification.
-        await _notify_admin_new_user(bot, db, user, message.from_user)
+        try:
+            await _notify_admin_new_user(bot, db, user, message.from_user)
+        except Exception as e:
+            logger.warning(f"Admin notification failed for new user {user_id}: {e}")
 
     # If already onboarded, run membership re-check first
     if user.get("onboarded"):
@@ -882,6 +888,9 @@ async def cmd_history(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "delete_account")
 async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await callback.message.answer("⛔ Account deletion is not available for your account.")
+        return
     await callback.message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -899,6 +908,9 @@ async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
 
 @router.message(Command("removemyaccount"))
 async def cmd_remove_account(message: Message, db, bot: Bot):
+    if message.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await message.answer("⛔ Account deletion is not available for your account.")
+        return
     await message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
@@ -917,6 +929,9 @@ async def cmd_remove_account(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "confirm_delete")
 async def confirm_delete_account(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    if callback.from_user.id not in SELF_DELETE_ALLOWED_IDS:
+        await callback.message.answer("⛔ Account deletion is not available for your account.")
+        return
     user_id = callback.from_user.id
     await delete_user(db, user_id)
     await callback.message.answer(
