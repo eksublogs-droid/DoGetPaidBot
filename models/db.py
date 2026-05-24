@@ -130,6 +130,58 @@ async def get_banned_users(db: AsyncIOMotorDatabase):
     return await db.users.find({"banned": True}).to_list(length=None)
 
 
+async def get_flagged_users(db: AsyncIOMotorDatabase):
+    """Return all users where flagged=True."""
+    return await db.users.find({"flagged": True}).to_list(length=None)
+
+
+async def get_referral_leaderboard(db: AsyncIOMotorDatabase, limit: int = 10):
+    """Return top users by referral_count, descending."""
+    return await db.users.find(
+        {"referral_count": {"$gt": 0}},
+        {"telegram_id": 1, "username": 1, "referral_count": 1}
+    ).sort("referral_count", -1).limit(limit).to_list(length=None)
+
+
+async def get_withdrawal_stats(db: AsyncIOMotorDatabase) -> dict:
+    """Return counts and total amounts for each withdrawal status."""
+    pipeline = [
+        {"$group": {
+            "_id": "$status",
+            "count": {"$sum": 1},
+            "total": {"$sum": "$amount"}
+        }}
+    ]
+    rows = await db.withdrawals.aggregate(pipeline).to_list(length=None)
+    stats = {"pending": {"count": 0, "total": 0.0},
+             "approved": {"count": 0, "total": 0.0},
+             "rejected": {"count": 0, "total": 0.0},
+             "paid": {"count": 0, "total": 0.0}}
+    for r in rows:
+        key = r["_id"]
+        if key in stats:
+            stats[key] = {"count": r["count"], "total": r["total"]}
+    return stats
+
+
+async def get_total_paid_out(db: AsyncIOMotorDatabase) -> float:
+    """Return total amount from withdrawals with status 'paid'."""
+    pipeline = [
+        {"$match": {"status": "paid"}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]
+    result = await db.withdrawals.aggregate(pipeline).to_list(length=None)
+    return result[0]["total"] if result else 0.0
+
+
+async def task_title_exists(db: AsyncIOMotorDatabase, title: str) -> bool:
+    """Check if an active task with the same title already exists (case-insensitive)."""
+    import re
+    pattern = re.compile(f"^{re.escape(title.strip())}$", re.IGNORECASE)
+    existing = await db.tasks.find_one({"active": True, "title": {"$regex": pattern}})
+    return existing is not None
+
+
 async def reset_user(db: AsyncIOMotorDatabase, telegram_id: int):
     """Reset onboarding state so user goes through onboarding again."""
     await db.users.update_one(
