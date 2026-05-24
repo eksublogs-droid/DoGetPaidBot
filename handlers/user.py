@@ -46,23 +46,14 @@ async def verify_membership(user_id: int, bot: Bot, db) -> list:
 
 
 async def gate_check(message: Message, db, bot: Bot) -> bool:
-    """
-    Silently gate every action:
-    - If user not found or not onboarded → redirect to /start
-    - If user left a channel → show rejoin screen
-    Returns True if user can proceed, False if blocked.
-    """
-    user_id = message.from_user.id if hasattr(message, "from_user") and message.from_user else None
-    if not user_id:
-        return False
-
+    """Gate for Message handlers."""
+    user_id = message.from_user.id
     user = await get_user(db, user_id)
     if not user or not user.get("onboarded"):
         await message.answer(
             "⚠️ You haven't completed onboarding yet.\n\nType /start to begin."
         )
         return False
-
     not_in = await verify_membership(user_id, bot, db)
     if not_in:
         channels_text = "\n".join([f"• {t}" for t in not_in])
@@ -76,7 +67,31 @@ async def gate_check(message: Message, db, bot: Bot) -> bool:
             parse_mode="Markdown"
         )
         return False
+    return True
 
+
+async def gate_check_callback(callback: CallbackQuery, db, bot: Bot) -> bool:
+    """Gate for CallbackQuery handlers — uses callback.from_user.id correctly."""
+    user_id = callback.from_user.id
+    user = await get_user(db, user_id)
+    if not user or not user.get("onboarded"):
+        await callback.message.answer(
+            "⚠️ You haven't completed onboarding yet.\n\nType /start to begin."
+        )
+        return False
+    not_in = await verify_membership(user_id, bot, db)
+    if not_in:
+        channels_text = "\n".join([f"• {t}" for t in not_in])
+        onboarding_tasks = await get_onboarding_tasks(db)
+        channel_tasks = [t for t in onboarding_tasks if t["task_type"] == "join_channel"]
+        await callback.message.answer(
+            f"⚠️ *You've left some required channels!*\n\n"
+            f"Please rejoin:\n{channels_text}\n\n"
+            f"Tap *Done* after rejoining to continue.",
+            reply_markup=onboarding_keyboard(channel_tasks),
+            parse_mode="Markdown"
+        )
+        return False
     return True
 
 
@@ -315,7 +330,21 @@ async def show_dashboard(message: Message, db, user_id: int):
 @router.callback_query(F.data == "dashboard")
 async def back_to_dash(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
-    await show_colourful_menu(callback.message, db, callback.from_user.id, bot)
+    allowed = await gate_check_callback(callback, db, bot)
+    if not allowed:
+        return
+    user = await get_user(db, callback.from_user.id)
+    balance = user.get("balance", 0) if user else 0
+    referral_count = user.get("referral_count", 0) if user else 0
+    username = callback.from_user.first_name
+    await callback.message.answer(
+        f"👋 Hello *{username}*!\n\n"
+        f"💰 *Balance:* ₦{balance:,.0f}\n"
+        f"👥 *Referrals:* {referral_count}\n\n"
+        f"What would you like to do?",
+        reply_markup=colourful_dashboard_keyboard(balance, referral_count),
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────
@@ -412,10 +441,24 @@ async def cmd_history(message: Message, db, bot: Bot):
 @router.callback_query(F.data == "delete_account")
 async def delete_account_prompt(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
-    allowed = await gate_check(callback.message, db, bot)
-    if not allowed:
-        return
     await callback.message.answer(
+        "🗑️ *Delete My Account*\n\n"
+        "⚠️ This will permanently delete:\n"
+        "• Your balance\n"
+        "• Your referral history\n"
+        "• Your task completions\n"
+        "• Your withdrawal records\n"
+        "• All your data\n\n"
+        "You will start fresh as a new user.\n\n"
+        "*Are you sure?*",
+        reply_markup=confirm_delete_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.message(Command("removemyaccount"))
+async def cmd_remove_account(message: Message, db, bot: Bot):
+    await message.answer(
         "🗑️ *Delete My Account*\n\n"
         "⚠️ This will permanently delete:\n"
         "• Your balance\n"
@@ -448,13 +491,15 @@ async def confirm_delete_account(callback: CallbackQuery, db, bot: Bot):
 # ─────────────────────────────────────────
 
 @router.callback_query(F.data == "show_balance")
-async def show_balance(callback: CallbackQuery, db):
+async def show_balance(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    allowed = await gate_check_callback(callback, db, bot)
+    if not allowed:
+        return
     user = await get_user(db, callback.from_user.id)
     balance = user.get("balance", 0) if user else 0
     bot_settings = await get_settings(db)
     min_w = bot_settings.get("min_withdraw", 500)
-
     await callback.message.answer(
         f"💰 *Your Balance*\n\n"
         f"Available: ₦{balance:,.0f}\n"
@@ -471,14 +516,15 @@ async def show_balance(callback: CallbackQuery, db):
 @router.callback_query(F.data == "get_referral_link")
 async def get_referral_link(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    allowed = await gate_check_callback(callback, db, bot)
+    if not allowed:
+        return
     user_id = callback.from_user.id
     user = await get_user(db, user_id)
     bot_settings = await get_settings(db)
-
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     ref_reward = bot_settings.get("referral_reward", 100)
-
     await callback.message.answer(
         f"🔗 *Your Referral Link*\n\n"
         f"`{ref_link}`\n\n"
@@ -496,15 +542,16 @@ async def get_referral_link(callback: CallbackQuery, db, bot: Bot):
 @router.callback_query(F.data == "show_referrals")
 async def show_referrals(callback: CallbackQuery, db, bot: Bot):
     await callback.answer()
+    allowed = await gate_check_callback(callback, db, bot)
+    if not allowed:
+        return
     user = await get_user(db, callback.from_user.id)
     bot_settings = await get_settings(db)
     ref_reward = bot_settings.get("referral_reward", 100)
     ref_count = user.get("referral_count", 0)
     total_earned = ref_count * ref_reward
-
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={callback.from_user.id}"
-
     await callback.message.answer(
         f"👥 *Your Referrals*\n\n"
         f"Total referrals: *{ref_count}*\n"
