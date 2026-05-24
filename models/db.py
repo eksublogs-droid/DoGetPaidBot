@@ -117,6 +117,32 @@ async def get_all_users(db: AsyncIOMotorDatabase):
     return await db.users.find({"banned": False}).to_list(length=None)
 
 
+async def get_all_users_paginated(db: AsyncIOMotorDatabase, page: int = 0, page_size: int = 20):
+    """Return users in chunks of page_size by page number (0-indexed)."""
+    skip = page * page_size
+    users = await db.users.find({}).skip(skip).limit(page_size).to_list(length=None)
+    total = await db.users.count_documents({})
+    return users, total
+
+
+async def get_banned_users(db: AsyncIOMotorDatabase):
+    """Return all users where banned=True."""
+    return await db.users.find({"banned": True}).to_list(length=None)
+
+
+async def reset_user(db: AsyncIOMotorDatabase, telegram_id: int):
+    """Reset onboarding state so user goes through onboarding again."""
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {
+            "onboarded": False,
+            "onboarded_at": None,
+            "flagged": False,
+            "captcha_answer": None
+        }}
+    )
+
+
 # ─────────────────────────────────────────
 # TASK HELPERS
 # ─────────────────────────────────────────
@@ -159,6 +185,27 @@ async def delete_task(db: AsyncIOMotorDatabase, task_id: str):
 
 async def get_task_by_id(db: AsyncIOMotorDatabase, task_id: str):
     return await db.tasks.find_one({"_id": ObjectId(task_id)})
+
+
+async def toggle_task_onboarding(db: AsyncIOMotorDatabase, task_id: str):
+    """Flip the onboarding field between True and False."""
+    task = await get_task_by_id(db, task_id)
+    if not task:
+        return None
+    new_val = not task.get("onboarding", False)
+    await db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {"onboarding": new_val}}
+    )
+    return new_val
+
+
+async def update_task_reward(db: AsyncIOMotorDatabase, task_id: str, reward: float):
+    """Update the reward amount for a task."""
+    await db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {"reward": reward}}
+    )
 
 
 # ─────────────────────────────────────────
