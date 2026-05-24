@@ -249,6 +249,19 @@ async def confirm_withdrawal(callback: CallbackQuery, db, bot: Bot):
         await callback.message.edit_text("❌ This withdrawal request is no longer valid.")
         return
 
+    # Re-check balance at processing time — auto-reject if insufficient
+    current_balance = user.get("balance", 0) if user else 0
+    if current_balance < withdrawal["amount"]:
+        await update_withdrawal_status(db, withdrawal_id, "rejected", reason="Insufficient balance at time of processing")
+        await callback.message.edit_text(
+            f"❌ *Withdrawal cancelled.*\n\n"
+            f"Your current balance (₦{current_balance:,.0f}) is less than the requested amount "
+            f"(₦{withdrawal['amount']:,.0f}).\n\n"
+            f"Please check your balance and try again.",
+            parse_mode="Markdown"
+        )
+        return
+
     await update_user_balance(db, user_id, -withdrawal["amount"])
 
     await callback.message.edit_text(
@@ -256,7 +269,7 @@ async def confirm_withdrawal(callback: CallbackQuery, db, bot: Bot):
         f"Amount: ₦{withdrawal['amount']:,.0f}\n"
         f"Bank: {withdrawal['bank_name']}\n"
         f"Account: {withdrawal['bank_account']}\n\n"
-        f"⏳ Your payment will be processed shortly.",
+        f"⏳ Your withdrawal is being processed. We'll notify you once it's approved.",
         parse_mode="Markdown"
     )
 
