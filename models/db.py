@@ -25,12 +25,20 @@ async def create_user(db: AsyncIOMotorDatabase, telegram_id: int, username: str,
         "bank_account": None,
         "bank_name": None,
         "bank_code": None,
-        "onboarded": False,   # True after completing all onboarding tasks
+        "onboarded": False,       # True after completing all onboarding tasks
+        "onboarded_at": None,     # Timestamp when onboarding was completed
+        "flagged": False,         # True if onboarding completed in under 5 seconds
+        "captcha_answer": None,   # Temporarily stores correct captcha answer during onboarding
         "banned": False,
         "joined_at": datetime.utcnow()
     }
     await db.users.insert_one(user)
     return user
+
+
+async def count_all_users(db: AsyncIOMotorDatabase) -> int:
+    """Return total number of registered users."""
+    return await db.users.count_documents({})
 
 
 async def update_user_balance(db: AsyncIOMotorDatabase, telegram_id: int, amount: float):
@@ -41,6 +49,14 @@ async def update_user_balance(db: AsyncIOMotorDatabase, telegram_id: int, amount
     )
 
 
+async def set_user_balance(db: AsyncIOMotorDatabase, telegram_id: int, amount: float):
+    """Overwrite balance with an exact value."""
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"balance": amount}}
+    )
+
+
 async def set_user_bank(db: AsyncIOMotorDatabase, telegram_id: int, account: str, bank_name: str, bank_code: str):
     await db.users.update_one(
         {"telegram_id": telegram_id},
@@ -48,10 +64,45 @@ async def set_user_bank(db: AsyncIOMotorDatabase, telegram_id: int, account: str
     )
 
 
-async def mark_onboarded(db: AsyncIOMotorDatabase, telegram_id: int):
+async def mark_onboarded(db: AsyncIOMotorDatabase, telegram_id: int, flagged: bool = False):
     await db.users.update_one(
         {"telegram_id": telegram_id},
-        {"$set": {"onboarded": True}}
+        {"$set": {
+            "onboarded": True,
+            "onboarded_at": datetime.utcnow(),
+            "flagged": flagged,
+            "captcha_answer": None   # Clear captcha once onboarding is done
+        }}
+    )
+
+
+async def set_captcha_answer(db: AsyncIOMotorDatabase, telegram_id: int, answer: str):
+    """Store the correct captcha answer temporarily."""
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"captcha_answer": answer}}
+    )
+
+
+async def clear_captcha_answer(db: AsyncIOMotorDatabase, telegram_id: int):
+    """Clear captcha answer from DB."""
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"captcha_answer": None}}
+    )
+
+
+async def ban_user(db: AsyncIOMotorDatabase, telegram_id: int):
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"banned": True}}
+    )
+
+
+async def unban_user(db: AsyncIOMotorDatabase, telegram_id: int):
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {"banned": False}}
     )
 
 
