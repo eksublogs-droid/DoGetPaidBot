@@ -1,14 +1,21 @@
 import logging
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from models.db import (
     add_task, delete_task, get_all_tasks, get_settings,
     update_setting, get_all_users, get_pending_withdrawals,
-    get_pending_completions
+    get_pending_completions, get_user, update_user_balance,
+    delete_user, reset_user, ban_user, unban_user,
+    get_all_users_paginated, get_banned_users,
+    update_withdrawal_status, toggle_task_onboarding,
+    update_task_reward, get_task_by_id, count_all_users
 )
 from config.settings import settings
 
@@ -25,6 +32,10 @@ def _is_command(text: str) -> bool:
     return text is not None and text.startswith("/")
 
 
+# ─────────────────────────────────────────
+# FSM STATES
+# ─────────────────────────────────────────
+
 class AddTaskStates(StatesGroup):
     title = State()
     description = State()
@@ -36,8 +47,99 @@ class AddTaskStates(StatesGroup):
     channel_id = State()
 
 
+class UserBalanceStates(StatesGroup):
+    add_amount = State()
+    deduct_amount = State()
+
+
+class EditTaskRewardStates(StatesGroup):
+    new_reward = State()
+
+
+class BroadcastPhotoStates(StatesGroup):
+    photo = State()
+    caption = State()
+
+
 # ─────────────────────────────────────────
-# /admin — Admin menu
+# KEYBOARD HELPERS (admin-only, defined here to avoid cluttering keyboards.py)
+# ─────────────────────────────────────────
+
+def _users_list_keyboard(users: list, page: int, total: int, page_size: int = 20) -> InlineKeyboardMarkup:
+    buttons = []
+    for u in users:
+        uname = f"@{u['username']}" if u.get("username") else str(u["telegram_id"])
+        balance = u.get("balance", 0)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{uname} — ₦{balance:,.0f}",
+                callback_data=f"admin_user:{u['telegram_id']}"
+            )
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"admin_users_page:{page - 1}"))
+    total_pages = (total + page_size - 1) // page_size
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if (page + 1) * page_size < total:
+        nav.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"admin_users_page:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _user_detail_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    uid = str(user_id)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Add Balance", callback_data=f"admin_addbal:{uid}"),
+            InlineKeyboardButton(text="➖ Deduct Balance", callback_data=f"admin_deductbal:{uid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban:{uid}"),
+            InlineKeyboardButton(text="✅ Unban", callback_data=f"admin_unban:{uid}"),
+        ],
+        [
+            InlineKeyboardButton(text="🗑️ Remove", callback_data=f"admin_remove:{uid}"),
+            InlineKeyboardButton(text="🔄 Reset", callback_data=f"admin_reset:{uid}"),
+        ],
+        [InlineKeyboardButton(text="🔙 Back to Users", callback_data="admin_users_page:0")],
+    ])
+
+
+def _tasks_list_keyboard(tasks: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for t in tasks:
+        tag = "🟢" if t.get("onboarding") else "🔵"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{tag} {t['title']} — ₦{t['reward']:,.0f}",
+                callback_data=f"admin_task:{t['_id']}"
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _task_detail_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Delete", callback_data=f"admin_deltask:{task_id}")],
+        [InlineKeyboardButton(text="✏️ Edit Reward", callback_data=f"admin_editreward:{task_id}")],
+        [InlineKeyboardButton(text="🔄 Toggle Onboarding/Dashboard", callback_data=f"admin_toggleob:{task_id}")],
+        [InlineKeyboardButton(text="🔙 Back to Tasks", callback_data="admin_listtasks")],
+    ])
+
+
+def _cleartasks_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Yes, clear all", callback_data="admin_cleartasks_confirm"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="admin_cleartasks_cancel"),
+        ]
+    ])
+
+
+# ─────────────────────────────────────────
+# /admin — Admin menu (unchanged, no new commands added)
 # ─────────────────────────────────────────
 
 @router.message(Command("admin"))
@@ -247,7 +349,7 @@ async def _save_task(message: Message, state: FSMContext, db):
 
 
 # ─────────────────────────────────────────
-# LIST TASKS
+# LIST TASKS — inline buttons
 # ─────────────────────────────────────────
 
 @router.message(Command("listtasks"))
@@ -259,22 +361,128 @@ async def list_tasks(message: Message, state: FSMContext, db):
     if not tasks:
         await message.answer("No active tasks.")
         return
+    await message.answer(
+        "📋 *All Active Tasks*\nTap a task to manage it:",
+        reply_markup=_tasks_list_keyboard(tasks),
+        parse_mode="Markdown"
+    )
 
-    lines = ["📋 *All Active Tasks*\n"]
-    for t in tasks:
-        tag = "🟢 Onboarding" if t.get("onboarding") else "🔵 Dashboard"
-        lines.append(
-            f"{tag}\n"
-            f"ID: `{t['_id']}`\n"
-            f"Title: {t['title']}\n"
-            f"Type: {t['task_type']} | Confirm: {t['confirm_type']}\n"
-            f"Reward: ₦{t['reward']:,.0f}\n"
+
+@router.callback_query(F.data == "admin_listtasks")
+async def cb_list_tasks(callback: CallbackQuery, db):
+    tasks = await get_all_tasks(db)
+    if not tasks:
+        await callback.message.edit_text("No active tasks.")
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        "📋 *All Active Tasks*\nTap a task to manage it:",
+        reply_markup=_tasks_list_keyboard(tasks),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_task:"))
+async def cb_task_detail(callback: CallbackQuery, db):
+    task_id = callback.data.split(":", 1)[1]
+    task = await get_task_by_id(db, task_id)
+    if not task:
+        await callback.answer("Task not found.", show_alert=True)
+        return
+    tag = "🟢 Onboarding" if task.get("onboarding") else "🔵 Dashboard"
+    text = (
+        f"📋 *Task Detail*\n\n"
+        f"Title: *{task['title']}*\n"
+        f"Type: {task.get('task_type', 'N/A')}\n"
+        f"Confirm: {task.get('confirm_type', 'N/A')}\n"
+        f"Reward: ₦{task['reward']:,.0f}\n"
+        f"Placement: {tag}\n"
+        f"Link: {task.get('link') or 'None'}\n"
+        f"Description: {task.get('description') or 'None'}\n"
+        f"ID: `{task['_id']}`"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=_task_detail_keyboard(task_id),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_deltask:"))
+async def cb_delete_task(callback: CallbackQuery, db):
+    task_id = callback.data.split(":", 1)[1]
+    await delete_task(db, task_id)
+    tasks = await get_all_tasks(db)
+    if not tasks:
+        await callback.message.edit_text("✅ Task deleted. No active tasks remaining.")
+    else:
+        await callback.message.edit_text(
+            "✅ Task deleted.\n\n📋 *All Active Tasks*\nTap a task to manage it:",
+            reply_markup=_tasks_list_keyboard(tasks),
+            parse_mode="Markdown"
         )
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await callback.answer("Task deleted.")
+
+
+@router.callback_query(F.data.startswith("admin_toggleob:"))
+async def cb_toggle_onboarding(callback: CallbackQuery, db):
+    task_id = callback.data.split(":", 1)[1]
+    new_val = await toggle_task_onboarding(db, task_id)
+    label = "Onboarding" if new_val else "Dashboard"
+    await callback.answer(f"✅ Task moved to {label}.", show_alert=True)
+    # Refresh task detail view
+    task = await get_task_by_id(db, task_id)
+    if task:
+        tag = "🟢 Onboarding" if task.get("onboarding") else "🔵 Dashboard"
+        text = (
+            f"📋 *Task Detail*\n\n"
+            f"Title: *{task['title']}*\n"
+            f"Type: {task.get('task_type', 'N/A')}\n"
+            f"Confirm: {task.get('confirm_type', 'N/A')}\n"
+            f"Reward: ₦{task['reward']:,.0f}\n"
+            f"Placement: {tag}\n"
+            f"Link: {task.get('link') or 'None'}\n"
+            f"Description: {task.get('description') or 'None'}\n"
+            f"ID: `{task['_id']}`"
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=_task_detail_keyboard(task_id),
+            parse_mode="Markdown"
+        )
+
+
+@router.callback_query(F.data.startswith("admin_editreward:"))
+async def cb_edit_reward_start(callback: CallbackQuery, state: FSMContext):
+    task_id = callback.data.split(":", 1)[1]
+    await state.update_data(edit_reward_task_id=task_id)
+    await state.set_state(EditTaskRewardStates.new_reward)
+    await callback.message.answer("✏️ Enter the new reward amount in ₦ (numbers only):")
+    await callback.answer()
+
+
+@router.message(EditTaskRewardStates.new_reward)
+async def fsm_edit_reward(message: Message, state: FSMContext, db):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Edit cancelled.")
+        return
+    try:
+        new_reward = float(message.text.strip().replace(",", ""))
+    except ValueError:
+        await message.answer("❌ Numbers only. Try again:")
+        return
+    data = await state.get_data()
+    task_id = data.get("edit_reward_task_id")
+    await update_task_reward(db, task_id, new_reward)
+    await state.clear()
+    await message.answer(f"✅ Reward updated to ₦{new_reward:,.0f}")
 
 
 # ─────────────────────────────────────────
-# DELETE TASK
+# DELETE TASK (command)
 # ─────────────────────────────────────────
 
 @router.message(Command("deltask"))
@@ -289,6 +497,368 @@ async def del_task(message: Message, state: FSMContext, db):
     task_id = parts[1].strip()
     await delete_task(db, task_id)
     await message.answer(f"✅ Task `{task_id}` deleted.", parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
+# CLEAR ALL TASKS
+# ─────────────────────────────────────────
+
+@router.message(Command("cleartasks"))
+async def cleartasks_prompt(message: Message, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "⚠️ Are you sure you want to delete *all* active tasks? This cannot be undone.",
+        reply_markup=_cleartasks_confirm_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "admin_cleartasks_confirm")
+async def cb_cleartasks_confirm(callback: CallbackQuery, db):
+    await db.tasks.update_many({"active": True}, {"$set": {"active": False}})
+    await callback.message.edit_text("✅ All tasks have been cleared.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_cleartasks_cancel")
+async def cb_cleartasks_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("❌ Cancelled. No tasks were deleted.")
+    await callback.answer()
+
+
+# ─────────────────────────────────────────
+# USERS — paginated list
+# ─────────────────────────────────────────
+
+@router.message(Command("users"))
+async def cmd_users(message: Message, state: FSMContext, db):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    users, total = await get_all_users_paginated(db, page=0)
+    if not users:
+        await message.answer("No users found.")
+        return
+    await message.answer(
+        f"👥 *Users* (total: {total})\nTap a user to manage them:",
+        reply_markup=_users_list_keyboard(users, 0, total),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("admin_users_page:"))
+async def cb_users_page(callback: CallbackQuery, db):
+    page = int(callback.data.split(":", 1)[1])
+    users, total = await get_all_users_paginated(db, page=page)
+    if not users:
+        await callback.answer("No users on this page.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"👥 *Users* (total: {total})\nTap a user to manage them:",
+        reply_markup=_users_list_keyboard(users, page, total),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_user:"))
+async def cb_user_detail(callback: CallbackQuery, db):
+    uid = int(callback.data.split(":", 1)[1])
+    user = await get_user(db, uid)
+    if not user:
+        await callback.answer("User not found.", show_alert=True)
+        return
+
+    joined = user.get("joined_at")
+    joined_str = joined.strftime("%b %d, %Y") if joined else "N/A"
+    referred_by = user.get("referred_by") or "None"
+    onboarded_at = user.get("onboarded_at")
+    onboarded_str = onboarded_at.strftime("%b %d, %Y %H:%M") if onboarded_at else "No"
+
+    text = (
+        f"👤 *User Detail*\n\n"
+        f"ID: `{user['telegram_id']}`\n"
+        f"Username: @{user.get('username', 'N/A')}\n"
+        f"Balance: ₦{user.get('balance', 0):,.0f}\n"
+        f"Referrals: {user.get('referral_count', 0)}\n"
+        f"Referred by: {referred_by}\n"
+        f"Joined: {joined_str}\n"
+        f"Onboarded: {onboarded_str}\n"
+        f"Banned: {'Yes' if user.get('banned') else 'No'}\n"
+        f"Flagged: {'Yes' if user.get('flagged') else 'No'}"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=_user_detail_keyboard(uid),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+# ─── User action: Add Balance ───
+
+@router.callback_query(F.data.startswith("admin_addbal:"))
+async def cb_addbal_start(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.split(":", 1)[1])
+    await state.update_data(action_user_id=uid)
+    await state.set_state(UserBalanceStates.add_amount)
+    await callback.message.answer(f"➕ Enter amount to *add* to user `{uid}`'s balance (₦):", parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.message(UserBalanceStates.add_amount)
+async def fsm_addbal(message: Message, state: FSMContext, db, bot: Bot):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Action cancelled.")
+        return
+    try:
+        amount = float(message.text.strip().replace(",", ""))
+    except ValueError:
+        await message.answer("❌ Numbers only. Try again:")
+        return
+    data = await state.get_data()
+    uid = data["action_user_id"]
+    await update_user_balance(db, uid, amount)
+    await state.clear()
+    await message.answer(f"✅ Added ₦{amount:,.0f} to user `{uid}`.", parse_mode="Markdown")
+    try:
+        await bot.send_message(uid, f"💰 ₦{amount:,.0f} has been added to your balance by admin!")
+    except Exception:
+        pass
+
+
+# ─── User action: Deduct Balance ───
+
+@router.callback_query(F.data.startswith("admin_deductbal:"))
+async def cb_deductbal_start(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.split(":", 1)[1])
+    await state.update_data(action_user_id=uid)
+    await state.set_state(UserBalanceStates.deduct_amount)
+    await callback.message.answer(f"➖ Enter amount to *deduct* from user `{uid}`'s balance (₦):", parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.message(UserBalanceStates.deduct_amount)
+async def fsm_deductbal(message: Message, state: FSMContext, db, bot: Bot):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Action cancelled.")
+        return
+    try:
+        amount = float(message.text.strip().replace(",", ""))
+    except ValueError:
+        await message.answer("❌ Numbers only. Try again:")
+        return
+    data = await state.get_data()
+    uid = data["action_user_id"]
+    await update_user_balance(db, uid, -amount)
+    await state.clear()
+    await message.answer(f"✅ Deducted ₦{amount:,.0f} from user `{uid}`.", parse_mode="Markdown")
+    try:
+        await bot.send_message(uid, f"⚠️ ₦{amount:,.0f} has been deducted from your balance by admin.")
+    except Exception:
+        pass
+
+
+# ─── User action: Ban ───
+
+@router.callback_query(F.data.startswith("admin_ban:"))
+async def cb_ban_user(callback: CallbackQuery, db, bot: Bot):
+    uid = int(callback.data.split(":", 1)[1])
+    await ban_user(db, uid)
+    await callback.answer(f"✅ User {uid} banned.", show_alert=True)
+    try:
+        await bot.send_message(uid, "🚫 Your account has been banned.")
+    except Exception:
+        pass
+    # Refresh user detail
+    user = await get_user(db, uid)
+    if user:
+        await _refresh_user_detail(callback, user)
+
+
+# ─── User action: Unban ───
+
+@router.callback_query(F.data.startswith("admin_unban:"))
+async def cb_unban_user(callback: CallbackQuery, db, bot: Bot):
+    uid = int(callback.data.split(":", 1)[1])
+    await unban_user(db, uid)
+    await callback.answer(f"✅ User {uid} unbanned.", show_alert=True)
+    try:
+        await bot.send_message(uid, "✅ Your account has been unbanned.")
+    except Exception:
+        pass
+    user = await get_user(db, uid)
+    if user:
+        await _refresh_user_detail(callback, user)
+
+
+# ─── User action: Remove ───
+
+@router.callback_query(F.data.startswith("admin_remove:"))
+async def cb_remove_user(callback: CallbackQuery, db, bot: Bot):
+    uid = int(callback.data.split(":", 1)[1])
+    try:
+        await bot.send_message(uid, "🗑️ Your account and all associated data have been removed by admin.")
+    except Exception:
+        pass
+    await delete_user(db, uid)
+    await callback.message.edit_text(f"✅ User `{uid}` and all their data have been removed.", parse_mode="Markdown")
+    await callback.answer()
+
+
+# ─── User action: Reset ───
+
+@router.callback_query(F.data.startswith("admin_reset:"))
+async def cb_reset_user(callback: CallbackQuery, db, bot: Bot):
+    uid = int(callback.data.split(":", 1)[1])
+    await reset_user(db, uid)
+    await callback.answer(f"✅ User {uid} reset. They will redo onboarding.", show_alert=True)
+    try:
+        await bot.send_message(uid, "🔄 Your onboarding has been reset. Please use /start to begin again.")
+    except Exception:
+        pass
+    user = await get_user(db, uid)
+    if user:
+        await _refresh_user_detail(callback, user)
+
+
+async def _refresh_user_detail(callback: CallbackQuery, user: dict):
+    uid = user["telegram_id"]
+    joined = user.get("joined_at")
+    joined_str = joined.strftime("%b %d, %Y") if joined else "N/A"
+    referred_by = user.get("referred_by") or "None"
+    onboarded_at = user.get("onboarded_at")
+    onboarded_str = onboarded_at.strftime("%b %d, %Y %H:%M") if onboarded_at else "No"
+    text = (
+        f"👤 *User Detail*\n\n"
+        f"ID: `{uid}`\n"
+        f"Username: @{user.get('username', 'N/A')}\n"
+        f"Balance: ₦{user.get('balance', 0):,.0f}\n"
+        f"Referrals: {user.get('referral_count', 0)}\n"
+        f"Referred by: {referred_by}\n"
+        f"Joined: {joined_str}\n"
+        f"Onboarded: {onboarded_str}\n"
+        f"Banned: {'Yes' if user.get('banned') else 'No'}\n"
+        f"Flagged: {'Yes' if user.get('flagged') else 'No'}"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=_user_detail_keyboard(uid),
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────
+# /deductbalance [user_id] [amount]
+# ─────────────────────────────────────────
+
+@router.message(Command("deductbalance"))
+async def cmd_deduct_balance(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Usage: /deductbalance `[user_id]` `[amount]`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(parts[1])
+        amount = float(parts[2])
+        await update_user_balance(db, uid, -amount)
+        await message.answer(f"✅ Deducted ₦{amount:,.0f} from user `{uid}`.", parse_mode="Markdown")
+        try:
+            await bot.send_message(uid, f"⚠️ ₦{amount:,.0f} has been deducted from your balance by admin.")
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ Invalid inputs.")
+
+
+# ─────────────────────────────────────────
+# /removeuser [user_id]
+# ─────────────────────────────────────────
+
+@router.message(Command("removeuser"))
+async def cmd_remove_user(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: /removeuser `[user_id]`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(parts[1])
+        try:
+            await bot.send_message(uid, "🗑️ Your account and all associated data have been removed by admin.")
+        except Exception:
+            pass
+        await delete_user(db, uid)
+        await message.answer(f"✅ User `{uid}` and all their data have been removed.", parse_mode="Markdown")
+    except ValueError:
+        await message.answer("❌ Invalid user ID.")
+
+
+# ─────────────────────────────────────────
+# /totalusers
+# ─────────────────────────────────────────
+
+@router.message(Command("totalusers"))
+async def cmd_total_users(message: Message, state: FSMContext, db):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    total = await count_all_users(db)
+    await message.answer(f"👥 Total registered users: *{total}*", parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
+# /bannedusers
+# ─────────────────────────────────────────
+
+@router.message(Command("bannedusers"))
+async def cmd_banned_users(message: Message, state: FSMContext, db):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    banned = await get_banned_users(db)
+    if not banned:
+        await message.answer("✅ No banned users.")
+        return
+    lines = ["🚫 *Banned Users*\n"]
+    for u in banned:
+        uname = f"@{u['username']}" if u.get("username") else "N/A"
+        lines.append(f"ID: `{u['telegram_id']}` — {uname}")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
+# /resetuser [user_id]
+# ─────────────────────────────────────────
+
+@router.message(Command("resetuser"))
+async def cmd_reset_user(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: /resetuser `[user_id]`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(parts[1])
+        await reset_user(db, uid)
+        await message.answer(f"✅ User `{uid}` has been reset. They will redo onboarding.", parse_mode="Markdown")
+        try:
+            await bot.send_message(uid, "🔄 Your onboarding has been reset. Please use /start to begin again.")
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ Invalid user ID.")
 
 
 # ─────────────────────────────────────────
@@ -344,6 +914,26 @@ async def set_reward_pool(message: Message, state: FSMContext, db):
         await message.answer(f"✅ Total reward pool set to ₦{amount:,.0f}")
     except ValueError:
         await message.answer("❌ Invalid amount.")
+
+
+# ─────────────────────────────────────────
+# /settings — show all current settings
+# ─────────────────────────────────────────
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, state: FSMContext, db):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    s = await get_settings(db)
+    await message.answer(
+        f"⚙️ *Current Settings*\n\n"
+        f"Bot Name: *{s.get('bot_name', 'N/A')}*\n"
+        f"Min Withdrawal: ₦{s.get('min_withdraw', 0):,.0f}\n"
+        f"Referral Reward: ₦{s.get('referral_reward', 0):,.0f}\n"
+        f"Total Reward Pool: ₦{s.get('total_reward_pool', 0):,.0f}",
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────
@@ -407,11 +997,66 @@ async def broadcast(message: Message, state: FSMContext, db, bot: Bot):
 
 
 # ─────────────────────────────────────────
-# BAN / UNBAN
+# /broadcastphoto — FSM: photo → caption → send
+# ─────────────────────────────────────────
+
+@router.message(Command("broadcastphoto"))
+async def broadcastphoto_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("📸 Send the photo you want to broadcast:")
+    await state.set_state(BroadcastPhotoStates.photo)
+
+
+@router.message(BroadcastPhotoStates.photo)
+async def broadcastphoto_get_photo(message: Message, state: FSMContext):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Broadcast photo cancelled.")
+        return
+    if not message.photo:
+        await message.answer("❌ Please send a photo (image file).")
+        return
+    photo_id = message.photo[-1].file_id
+    await state.update_data(broadcast_photo_id=photo_id)
+    await message.answer("✏️ Now send the caption for this photo (or `-` for no caption):")
+    await state.set_state(BroadcastPhotoStates.caption)
+
+
+@router.message(BroadcastPhotoStates.caption)
+async def broadcastphoto_send(message: Message, state: FSMContext, db, bot: Bot):
+    if _is_command(message.text):
+        await state.clear()
+        await message.answer("⚠️ Broadcast photo cancelled.")
+        return
+    caption = message.text.strip()
+    if caption == "-":
+        caption = None
+    data = await state.get_data()
+    photo_id = data.get("broadcast_photo_id")
+    await state.clear()
+
+    users = await get_all_users(db)
+    sent, failed = 0, 0
+    await message.answer(f"📡 Broadcasting photo to {len(users)} users...")
+
+    for user in users:
+        try:
+            await bot.send_photo(user["telegram_id"], photo=photo_id, caption=caption)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(f"✅ Photo broadcast done.\nSent: {sent} | Failed: {failed}")
+
+
+# ─────────────────────────────────────────
+# BAN / UNBAN (command)
 # ─────────────────────────────────────────
 
 @router.message(Command("ban"))
-async def ban_user(message: Message, state: FSMContext, db):
+async def ban_user_cmd(message: Message, state: FSMContext, db):
     await state.clear()
     if not is_admin(message.from_user.id):
         return
@@ -425,7 +1070,7 @@ async def ban_user(message: Message, state: FSMContext, db):
 
 
 @router.message(Command("unban"))
-async def unban_user(message: Message, state: FSMContext, db):
+async def unban_user_cmd(message: Message, state: FSMContext, db):
     await state.clear()
     if not is_admin(message.from_user.id):
         return
@@ -439,7 +1084,7 @@ async def unban_user(message: Message, state: FSMContext, db):
 
 
 # ─────────────────────────────────────────
-# ADD BALANCE MANUALLY
+# ADD BALANCE MANUALLY (command)
 # ─────────────────────────────────────────
 
 @router.message(Command("addbalance"))
@@ -454,7 +1099,6 @@ async def add_balance(message: Message, state: FSMContext, db, bot: Bot):
     try:
         uid = int(parts[1])
         amount = float(parts[2])
-        from models.db import update_user_balance
         await update_user_balance(db, uid, amount)
         await message.answer(f"✅ Added ₦{amount:,.0f} to user `{uid}`", parse_mode="Markdown")
         try:
@@ -493,6 +1137,69 @@ async def pending_withdrawals(message: Message, state: FSMContext, db):
 
 
 # ─────────────────────────────────────────
+# /approveall — approve all pending withdrawals
+# ─────────────────────────────────────────
+
+@router.message(Command("approveall"))
+async def cmd_approveall(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    pending = await get_pending_withdrawals(db)
+    if not pending:
+        await message.answer("✅ No pending withdrawals to approve.")
+        return
+    approved_count = 0
+    for w in pending:
+        wid = str(w["_id"])
+        uid = w["user_id"]
+        amount = w["amount"]
+        await update_withdrawal_status(db, wid, "approved")
+        await update_user_balance(db, uid, amount)
+        approved_count += 1
+        try:
+            await bot.send_message(
+                uid,
+                f"✅ Your withdrawal of ₦{amount:,.0f} has been approved and credited to your account!"
+            )
+        except Exception:
+            pass
+    await message.answer(f"✅ Approved and credited {approved_count} withdrawal(s).")
+
+
+# ─────────────────────────────────────────
+# /rejectwithdrawal [id] [reason]
+# ─────────────────────────────────────────
+
+@router.message(Command("rejectwithdrawal"))
+async def cmd_reject_withdrawal(message: Message, state: FSMContext, db, bot: Bot):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(None, 2)
+    if len(parts) < 3:
+        await message.answer("Usage: /rejectwithdrawal `[withdrawal_id]` `[reason]`", parse_mode="Markdown")
+        return
+    wid = parts[1].strip()
+    reason = parts[2].strip()
+    withdrawal = await db.withdrawals.find_one({"_id": __import__("bson").ObjectId(wid)})
+    if not withdrawal:
+        await message.answer("❌ Withdrawal not found.")
+        return
+    await update_withdrawal_status(db, wid, "rejected", reason=reason)
+    uid = withdrawal["user_id"]
+    amount = withdrawal["amount"]
+    try:
+        await bot.send_message(
+            uid,
+            f"❌ Your withdrawal of ₦{amount:,.0f} was rejected.\nReason: {reason}"
+        )
+    except Exception:
+        pass
+    await message.answer(f"✅ Withdrawal `{wid}` rejected. User notified.", parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
 # PENDING TASK APPROVALS
 # ─────────────────────────────────────────
 
@@ -507,7 +1214,6 @@ async def pending_tasks(message: Message, state: FSMContext, db):
         return
     for c in pending:
         from utils.keyboards import admin_task_completion_keyboard
-        from models.db import get_task_by_id
         task = await get_task_by_id(db, c["task_id"])
         task_title = task["title"] if task else c["task_id"]
         reward = task["reward"] if task else 0
@@ -520,3 +1226,12 @@ async def pending_tasks(message: Message, state: FSMContext, db):
             reply_markup=admin_task_completion_keyboard(c["task_id"], c["user_id"], c["task_id"]),
             parse_mode="Markdown"
         )
+
+
+# ─────────────────────────────────────────
+# noop callback (pagination label button)
+# ─────────────────────────────────────────
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
