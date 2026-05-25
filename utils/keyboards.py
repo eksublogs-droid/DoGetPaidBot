@@ -2,37 +2,41 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent bottom reply keyboard — always visible in chat."""
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Menu")]
-        ],
+        keyboard=[[KeyboardButton(text="📋 Menu")]],
         resize_keyboard=True,
         persistent=True
     )
 
 
 def colourful_dashboard_keyboard(balance: float, referral_count: int) -> InlineKeyboardMarkup:
-    """Colourful dashboard panel — shown when Menu button or /menu is pressed."""
     buttons = [
+        [InlineKeyboardButton(text=f"💰 Balance: ₦{balance:,.0f}", callback_data="show_balance")],
         [
-            InlineKeyboardButton(text=f"🔵 💰 Balance: ₦{balance:,.0f}", callback_data="show_balance"),
-            InlineKeyboardButton(text=f"🔵 👥 Referrals: {referral_count}", callback_data="show_referrals"),
+            InlineKeyboardButton(text=f"👥 Referrals: {referral_count}", callback_data="show_referrals"),
+            InlineKeyboardButton(text="🔗 Referral Link", callback_data="get_referral_link"),
         ],
-        [InlineKeyboardButton(text="🟢 🔗 My Referral Link", callback_data="get_referral_link")],
-        [InlineKeyboardButton(text="🟡 ✅ Tasks", callback_data="show_tasks")],
+        [InlineKeyboardButton(text="📢 Run Ad", callback_data="run_ad")],
         [
-            InlineKeyboardButton(text="🟠 💳 Set Bank Account", callback_data="set_bank"),
-            InlineKeyboardButton(text="🔴 💸 Withdraw", callback_data="withdraw"),
+            InlineKeyboardButton(text="✅ Tasks", callback_data="show_tasks"),
+            InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw"),
         ],
-        [InlineKeyboardButton(text="🟣 📜 Withdrawal History", callback_data="withdraw_history")],
+        [InlineKeyboardButton(text="💳 Set Bank Account", callback_data="set_bank")],
+        [
+            InlineKeyboardButton(text="📜 History", callback_data="show_history"),
+            InlineKeyboardButton(text="🎁 Daily Check-In", callback_data="daily_checkin"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 My Profile", callback_data="show_profile"),
+            InlineKeyboardButton(text="📊 Leaderboard", callback_data="show_leaderboard"),
+        ],
+        [InlineKeyboardButton(text="📋 My Ads", callback_data="my_ads_status")],
         [InlineKeyboardButton(text="🗑️ Delete My Account", callback_data="delete_account")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def confirm_delete_keyboard() -> InlineKeyboardMarkup:
-    """Confirmation keyboard for account deletion."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Yes, Delete Everything", callback_data="confirm_delete"),
@@ -42,22 +46,16 @@ def confirm_delete_keyboard() -> InlineKeyboardMarkup:
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
-    """Welcome screen proceed button."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Proceed", callback_data="proceed_onboarding")]
     ])
 
 
 def onboarding_keyboard(tasks: list, show_done: bool = True) -> InlineKeyboardMarkup:
-    """Build the channel join keyboard."""
     buttons = []
-
     if tasks:
         first = tasks[0]
-        buttons.append([
-            InlineKeyboardButton(text=f"💸 {first['title']} ↗", url=first["link"])
-        ])
-
+        buttons.append([InlineKeyboardButton(text=f"💸 {first['title']} ↗", url=first["link"])])
     rest = tasks[1:]
     row = []
     for task in rest:
@@ -67,15 +65,12 @@ def onboarding_keyboard(tasks: list, show_done: bool = True) -> InlineKeyboardMa
             row = []
     if row:
         buttons.append(row)
-
     if show_done:
         buttons.append([InlineKeyboardButton(text="✅ Done", callback_data="onboarding_done")])
-
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def whatsapp_tasks_keyboard(tasks: list) -> InlineKeyboardMarkup:
-    """WhatsApp groups keyboard with I've Joined button."""
     buttons = []
     row = []
     for task in tasks:
@@ -85,26 +80,13 @@ def whatsapp_tasks_keyboard(tasks: list) -> InlineKeyboardMarkup:
             row = []
     if row:
         buttons.append(row)
-
     buttons.append([InlineKeyboardButton(text="✅ I've Joined", callback_data="whatsapp_joined")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def dashboard_keyboard(balance: float, referral_count: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(text=f"💰 Balance: ₦{balance:,.0f}", callback_data="show_balance"),
-            InlineKeyboardButton(text=f"👥 Referrals: {referral_count}", callback_data="show_referrals"),
-        ],
-        [InlineKeyboardButton(text="🔗 My Referral Link", callback_data="get_referral_link")],
-        [InlineKeyboardButton(text="✅ Tasks", callback_data="show_tasks")],
-        [
-            InlineKeyboardButton(text="💳 Set Bank Account", callback_data="set_bank"),
-            InlineKeyboardButton(text="💸 Withdraw", callback_data="withdraw"),
-        ],
-        [InlineKeyboardButton(text="📜 Withdrawal History", callback_data="withdraw_history")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    # Kept for backward compat; just calls colourful version
+    return colourful_dashboard_keyboard(balance, referral_count)
 
 
 def tasks_keyboard(tasks: list, completed_ids: list) -> InlineKeyboardMarkup:
@@ -112,9 +94,20 @@ def tasks_keyboard(tasks: list, completed_ids: list) -> InlineKeyboardMarkup:
     for task in tasks:
         task_id = str(task["_id"])
         done = task_id in completed_ids
-        label = f"{'✅' if done else '🔲'} {task['title']} (+₦{task['reward']:,.0f})"
+        paused = task.get("paused", False)
+        slots = task.get("slots")
+        slots_filled = task.get("slots_filled", 0)
+        full = slots is not None and slots_filled >= slots
+
+        pin_icon = "📌 " if task.get("pinned") else ""
+        label = f"{pin_icon}{'✅' if done else ('⏸' if paused else ('🔴' if full else '🔲'))} {task['title']} (+₦{task['reward']:,.0f})"
+        if slots is not None:
+            label += f" [{slots_filled}/{slots}]"
+
         if done:
             buttons.append([InlineKeyboardButton(text=label, callback_data="already_done")])
+        elif paused or full:
+            buttons.append([InlineKeyboardButton(text=label, callback_data="task_unavailable")])
         else:
             row = []
             if task.get("link"):
@@ -145,7 +138,7 @@ def confirm_withdraw_keyboard(amount: float, withdrawal_id: str) -> InlineKeyboa
 def admin_withdrawal_keyboard(withdrawal_id: str, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve & Pay", callback_data=f"admin_approve:{withdrawal_id}:{user_id}"),
+            InlineKeyboardButton(text="✅ Mark as Paid", callback_data=f"admin_approve:{withdrawal_id}:{user_id}"),
             InlineKeyboardButton(text="❌ Reject", callback_data=f"admin_reject:{withdrawal_id}:{user_id}"),
         ]
     ])
@@ -157,4 +150,78 @@ def admin_task_completion_keyboard(completion_id: str, user_id: int, task_id: st
             InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_task:{user_id}:{task_id}"),
             InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_task:{user_id}:{task_id}"),
         ]
+    ])
+
+
+# ─────────────────────────────────────────
+# WITHDRAWAL METHOD KEYBOARD
+# ─────────────────────────────────────────
+
+def withdraw_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🏦 Bank Account", callback_data="withdraw_method:bank"),
+            InlineKeyboardButton(text="📱 Airtime", callback_data="withdraw_method:airtime"),
+        ],
+        [InlineKeyboardButton(text="🔙 Back to Dashboard", callback_data="dashboard")],
+    ])
+
+
+def airtime_network_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="MTN", callback_data="airtime_network:MTN"),
+            InlineKeyboardButton(text="Airtel", callback_data="airtime_network:Airtel"),
+        ],
+        [
+            InlineKeyboardButton(text="Glo", callback_data="airtime_network:Glo"),
+            InlineKeyboardButton(text="9mobile", callback_data="airtime_network:9mobile"),
+        ],
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data="dashboard")],
+    ])
+
+
+# ─────────────────────────────────────────
+# ADS KEYBOARDS
+# ─────────────────────────────────────────
+
+def ad_tier_keyboard(tiers: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    tier_labels = {"basic": "🟢 Basic", "standard": "🔵 Standard", "premium": "⭐ Premium"}
+    for tier_key, info in tiers.items():
+        label = f"{tier_labels.get(tier_key, tier_key)} — ₦{info['price']:,} ({info['description']})"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"ad_tier:{tier_key}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Cancel", callback_data="dashboard")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def ad_confirm_keyboard(ad_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Pay & Submit", callback_data=f"ad_pay:{ad_id}"),
+            InlineKeyboardButton(text="❌ Cancel", callback_data="dashboard"),
+        ]
+    ])
+
+
+def admin_ad_review_keyboard(ad_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Approve & Publish", callback_data=f"admin_ad_approve:{ad_id}"),
+            InlineKeyboardButton(text="❌ Reject", callback_data=f"admin_ad_reject:{ad_id}"),
+        ]
+    ])
+
+
+# ─────────────────────────────────────────
+# HISTORY KEYBOARD
+# ─────────────────────────────────────────
+
+def history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💰 Transactions", callback_data="history_transactions"),
+            InlineKeyboardButton(text="💸 Withdrawals", callback_data="history_withdrawals"),
+        ],
+        [InlineKeyboardButton(text="🔙 Back to Dashboard", callback_data="dashboard")],
     ])
